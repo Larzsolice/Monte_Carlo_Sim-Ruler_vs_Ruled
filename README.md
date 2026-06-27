@@ -1,6 +1,6 @@
 # Ruler vs Ruled: Monte Carlo Simulation and Analysis Pipeline
 
-Created by Larzsolice (https://medium.com/@larzsolice).
+Created by Larzsolice (https://medium.com/@larzsolice or https://substack.com/@thepragmaticrealist).
 
 This repository contains the complete, high-performance simulation engine and analytical pipeline for the Ruler vs Ruled system dynamics model. The project models the interaction between a governing entity (Ruler) and a population (Ruled) as an escalating, multi-turn game of Chicken with a dynamic, wasting resource pool.
 
