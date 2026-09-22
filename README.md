@@ -27,6 +27,7 @@ The pipeline runs eight distinct simulation frameworks to isolate the impact of 
 * Simulation 6 (Aggressive Ruler TFT): Ruler is aggressive (>0.5); Ruled adopts Tit-for-Tat copying.
 * Simulation 7 (Aggressive Ruled): Ruler is neutral; Ruled is hard-coded to be aggressive (>0.5).
 * Simulation 8 (Aggressive Ruled TFT): Ruler adopts TFT copying; Ruled remains aggressive (>0.5).
+* Simulation 8 (Blind Control TFT): Same as Blind Control, but both players play Tit-for-Tat.
 
 
 ## Strategic National Archetypes (Sims 3–8)
@@ -40,58 +41,22 @@ Societies are modeled with five explicit aversion penalties representing how the
 * Brinksmen: Asymmetric de-escalation (Ruled is insulated from decay; Ruler de-escalates linearly).
 
 
-## Analytical Methodology & Data Processing
+## Graphical Representations
 
-The pipeline automates several advanced data science and clustering operations:
+The Prosperity Scores and Termination Proportions are displayed in paired bar graphs to assess how well societies perform.
 
+The Prosperity Score is the sum of Residual Perceived Value (after Net Costs are subtracted) at the end of each step of the simulation.
 
-### 1. Principal Component Analysis (PCA)
-
-To visualize the multi-dimensional behavior space in a 2D coordinate map, PCA compresses six core behavioral metrics:
-* Average Ruler and Ruled Hawkishness (P_Hawk)
-* Average Ruler and Ruled Costs incurred
-* Average Ruler and Ruled Aversion Penalties applied
-
-To prevent scale-drowning and ensure that spatial clustering represents genuine behavioral manifolds, the Prosperity Score (V_res) is explicitly withheld from the input PCA matrix.
-
-
-### 2. Dynamically Optimized KDE Valley Clustering
-
-Rather than using arbitrary thresholds, the pipeline segments outcome prosperity curves using Kernel Density Estimation (KDE) on Cumulative V_res:
-* Sweeps bandwidth factors at fine resolution (0.01) on the persistent multiprocessing workers.
-* Dynamically filters out the top 5 highest peak-producing bandwidths to prevent high-frequency noise and over-fitting.
-* Discovers local density minima ("valleys") from the remaining stable fits to mathematically partition outcomes into discrete, ordered performance clusters.
-
-
-### 3. High-Performance Multiprocessing Architecture
-
-The engine initializes a persistent daemon pool of 10 worker processes on startup. Tasks (Simulations, KDE bandwidth sweeps, and PCA plots) are routed through process-safe queues (multiprocessing.Queue). This completely bypasses the massive overhead of repeatedly spawning and destroying process pools.
-
-
-### Visual Marker Conventions (PCA Plots)
-
-The generated plots use precise marker styles to immediately distinguish elite trajectories from failed societies:
-* Standard Survivals: Unbordered, semi-transparent colored circles (o).
-* Failed Societies: Solid colored crosses (x) corresponding to their KDE cluster.
-* Top 100 Elite Performers: Marked with black-bordered semi-transparent diamonds (d).
-* Bottom 100 Lowest Performers: Marked with solid black crosses if they failed, or empty black circles (o) if they survived despite degraded conditions.
-
-
-## Output Files
-
-Upon successful execution, all generated assets are exported and compressed directly into a ZIP archive containing:
-* Report.docx: A professional, fully typeset Microsoft Word report using Candara typography, left-aligned headings, justified paragraphs, centered figures, and archetype-specific state failure tables.
-* results_summary.xlsx: Complete outcome metrics per simulation run.
-* results_pca_features.xlsx: Multi-dimensional feature matrix mapped to the calculated global PCA coordinates.
-* params.txt: A reference sheet outlining all configuration parameters and the dynamically selected KDE bandwidth.
-* Graphs/: A subfolder housing the isolated local and global behavioral PCA plots, count abundance sweeps, multi-panel early failure ratios, and 4-panel performance subplots.
+The Termination Proportions display how many simulations ended with state failure, classifying termination events as either Revolution or government Crackdown.
 
 
 ## Requirements
 
 Ensure you have the following third-party Python packages installed:
 
-    pip install pandas numpy scipy matplotlib seaborn scikit-learn python-docx openpyxl
+    pip install pandas numpy scipy matplotlib seaborn scikit-learn python-docx 
+
+The simulations are faster if you have a CUDA-enabled version of pytorch installed.
 
 
 
@@ -102,11 +67,10 @@ At the absolute top of the ruler_ruled_sim.py file, you will find the main simul
     # ==========================================
     # SIMULATION PARAMETERS 
     # ==========================================
-    PERCEIVED_VALUE = 10.0  # Value of a society
+    PERCEIVED_VALUE = 8.0   # Value of a society
     MAX_COST_PER_STEP = 1.0 # Per player
     MAX_STEPS = 1000        # Per simulation
-    N_REPS = 1000           # Number of repetitions for each simulated situation
-    RECORD_HISTORY = False  # Slow and resource intensive, use on smaller N_REPS only
+    N_REPS = 1000000        # Number of repetitions for each simulated situation
 
 
 ## Calibration Recommendations
