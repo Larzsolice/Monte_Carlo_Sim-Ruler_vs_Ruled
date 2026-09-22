@@ -1,6 +1,7 @@
 """
 Ruler vs Ruled - Monte Carlo Simulation and Analysis Pipeline
-Created by Larzsolice Aarend (find me on Medium)
+Created by the Pragmatic Realist
+Find me on Substack: https://thepragmaticrealist.substack.com
 Coded with assistance from Gemini
 
 -------------------------------------------------------------
@@ -8,11 +9,11 @@ Coded with assistance from Gemini
 Required Third-Party Libraries:
 - pandas (Data manipulation and Excel export)
 - numpy (Numerical operations)
-- scipy (Kernel Density Estimation for clustering)
+- scipy (Statistical operations)
 - matplotlib & seaborn (Data visualization)
-- scikit-learn (PCA and preprocessing)
 - python-docx (Automated Word report generation)
 - openpyxl (Excel file generation, utilized by pandas under the hood)
+- pytorch (Must be a CUDA version for GPU access)
 
 Simulation Overview:
 - Simulation 1: Stochastic Baseline.
@@ -20,24 +21,49 @@ Simulation Overview:
 - Simulation 3 & 4: Neutral Players (Base) vs Neutral Players (Tit-For-Tat) across 5 Archetypes.
 - Simulation 5 & 6: Aggressive Ruler (Base) vs Aggressive Ruler (Tit-For-Tat).
 - Simulation 7 & 8: Aggressive Ruled (Base) vs Aggressive Ruled (Tit-For-Tat).
+- Simulation 9: Blind Control mapped over fixed starting Quadrants, utilizing Tit-For-Tat.
+
+For N_reps = 1000000, you will need 76 GB of disc space if RECORD_HISTORY is False. This can be almost halved if files are not repackaged into a zip file.
 """
 
-if __name__ == "__main__": print("Initializing simulation environment...", flush=True)
+if __name__ == "__main__": print("\nInitializing simulation environment...", flush=True)
 
 # ==========================================
 # SIMULATION PARAMETERS 
 # ==========================================
-PERCEIVED_VALUE = 10.0  # Value of a society
+PERCEIVED_VALUE = 8.0   # Value of a society
 MAX_COST_PER_STEP = 1.0 # Per player
 MAX_STEPS = 1000        # Per simulation
-N_REPS = 1000           # Number of repetitions for each simulated situation
+N_REPS = 10000          # Number of repetitions for each simulated situation
 RECORD_HISTORY = False  # Slow and resource intensive, use on smaller N_REPS only
+SORT_DATA = False       # If True, large dataset exports will be sorted before archiving (Requires Memory)
 
+TEMP_DIR = "temp"
+OUTPUT_PREFIX = "Ruler_Vs_Ruled_Simulation"
+FILE_REPORT = "01_Simulation_Report.docx"
+FILE_SUMMARY = "02_Simulation_Summary_Results.csv"
+FILE_FEATURES = "03_Simulation_Features_Results.csv"
+FILE_HISTORY = "04_Simulation_Turn_History.csv"
+FILE_PARAMS = "05_Simulation_Parameters.txt"
+
+STANDARD_ARCHETYPE_ORDER = ['Equals', 'Cowards', 'Fools', 'Brinksmen', 'Tyrants', 'Control']
+SIM_LABELS = {
+    1: "Sim 1 Base", 2: "Sim 2 Control Base", 9: "Sim 9 Control TFT", 
+    3: "Sim 3 Neutral Base", 4: "Sim 4 Neutral TFT", 
+    5: "Sim 5 Agg Ruler Base", 6: "Sim 6 Agg Ruler TFT", 
+    7: "Sim 7 Agg Ruled Base", 8: "Sim 8 Agg Ruled TFT"
+}
+SIM_PAIRS = [
+    (2, 9, 'Control (Sim 2 vs 9)'),
+    (3, 4, 'Neutral (Sim 3 vs 4)'),
+    (5, 6, 'Aggressive Ruler (Sim 5 vs 6)'),
+    (7, 8, 'Aggressive Ruled (Sim 7 vs 8)')
+]
 
 # ==========================================
 # SLOW IMPORT LOADING
 # ==========================================
-n_import_chunks = 8
+n_import_chunks = 6
 
 def print_import_progress(step, name):
     bar_length = 30
@@ -57,203 +83,297 @@ import random
 import zipfile
 import multiprocessing
 import time
+import queue
+
+# Workaround for OpenMP runtime conflict (OMP: Error #15)
+os.environ['KMP_DUPLICATE_LIB_OK'] = 'TRUE'
+
+
 
 # Slow imports
-if __name__ == "__main__": print_import_progress(2, "pandas")
+if __name__ == "__main__": print_import_progress(2, "pandas/numpy/scipy")
 import pandas as pd
-
-if __name__ == "__main__": print_import_progress(3, "numpy")
 import numpy as np
+import scipy.stats as stats
+import warnings
 
-if __name__ == "__main__": print_import_progress(4, "matplotlib")
+
+if __name__ == "__main__": print_import_progress(3, "matplotlib")
 import matplotlib.pyplot as plt
 from matplotlib.patches import Patch
 
-if __name__ == "__main__": print_import_progress(5, "seaborn")
+if __name__ == "__main__": print_import_progress(4, "seaborn")
 import seaborn as sns
 
-if __name__ == "__main__": print_import_progress(6, "scipy")
-from scipy.stats import gaussian_kde
-
-if __name__ == "__main__": print_import_progress(7, "sklearn")
-from sklearn.decomposition import PCA
-from sklearn.preprocessing import StandardScaler
-
-if __name__ == "__main__": print_import_progress(8, "python-docx")
+if __name__ == "__main__": print_import_progress(5, "python-docx")
 import docx
 from docx.shared import Inches
 from docx.enum.text import WD_ALIGN_PARAGRAPH
 from docx.enum.style import WD_STYLE_TYPE
 from docx.shared import RGBColor
 
+
+if __name__ == "__main__": print_import_progress(6, "pytorch")
+HAS_TORCH = False
+HAS_CUDA = False
+try:
+    # pass
+    import torch
+    HAS_TORCH = True
+    HAS_CUDA = torch.cuda.is_available()
+    # print(HAS_CUDA)
+    if HAS_CUDA:
+        # Enable CUDNN benchmarking for faster tensor execution
+        torch.backends.cudnn.benchmark = True
+except ImportError:
+    HAS_TORCH = False
+    HAS_CUDA = False
+
+if HAS_TORCH and int(np.__version__.split('.')[0]) >= 2:
+    try:
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            # This dummy conversion triggers the NumPy C-API warning if incompatible
+            _ = torch.zeros(1).numpy() 
+            if len(w) > 0:
+                for warn in w:
+                    if "Failed to initialize NumPy" in str(warn.message):
+                        if __name__ == "__main__": 
+                            print(f"\n\n[WARNING] PyTorch is incompatible with NumPy {np.__version__} (PyTorch expects NumPy 1.x).")
+                            print("[WARNING] GPU Acceleration has been DISABLED to prevent crashes.")
+                            print("[WARNING] To fix this and re-enable the GPU, please run the following command in your terminal:")
+                            print('          pip install "numpy<2"\n')
+                        HAS_CUDA = False
+                        HAS_TORCH = False
+                        break
+    except Exception:
+        HAS_CUDA = False
+        HAS_TORCH = False
+
 if __name__ == "__main__": 
     print_import_progress(n_import_chunks, "")
 
 # ==========================================
-# 1. CONFIGURATION
+# 3. CORE SIMULATION ENGINE & GPU ACCELERATION
 # ==========================================
 
-# KDE Settings
-KDE_BW_ADJUST = "dynamic" 
-KDE_TOP_N_PEAKS = 10 
-KDE_OPTIMISATION_STEP = 0.01 
-KDE_EXCLUDE_TOP_N_PEAKS = 5 
-KDE_PROGRESSBAR_CHUNKSIZE = 300
-
-# Graph Aesthetics
-PLOT_DOT_SIZE = 10
-PLOT_ALPHA = 0.5
-CROSS_ALPHA = 1.0
-CROSS_SIZE_RATIO = 0.90  
-DIAMOND_ALPHA = 1.0
-DIAMOND_SIZE_RATIO = 0.90
-LINEWIDTH = 1
-PLOT_PALETTE_PCA = "tab20"
-PLOT_PALETTE_UNIFIED = "tab10"
-
-# Performance Graph Settings
-N_PERFORMERS = 5 # Number of top/bottom performing states to report and plot
-
-# Target Filenames
-FILE_SUMMARY = "results_summary.xlsx"
-FILE_HISTORY = "results_history.xlsx"
-FILE_PCA_FEATURES = "results_pca_features.xlsx"
-FILE_PARAMS = "params.txt"
-FILE_REPORT = "Report.docx"
-
-OUTPUT_PREFIX = f"RulerVsRuled_V{PERCEIVED_VALUE}x{N_REPS}"
-TEMP_DIR = "temp_export"
-NUM_WORKERS = max(10, multiprocessing.cpu_count())  
-
-# Custom Pair-Matched Palette for 4-Panel Performance Graphs (Control Last)
-SIM_PALETTE = {
-    'Sim 3 Neutral': '#1f77b4',        # Dark Blue
-    'Sim 4 Neutral TFT': '#aec7e8',    # Light Blue
-    'Sim 5 Agg Ruler': '#ff7f0e',      # Dark Orange
-    'Sim 6 Agg Ruler TFT': '#ffbb78',  # Light Orange
-    'Sim 7 Agg Ruled': '#d62728',      # Dark Red
-    'Sim 8 Agg Ruled TFT': '#ff9896',  # Light Red
-    'Sim 2 Control': '#7f7f7f'         # Grey (Placed last to ensure colors align with specifications)
-}
-
-_task_queue = None
-_result_queue = None
-_workers = []
-
-# ==========================================
-# 2. PERSISTENT MULTIPROCESSING ENGINE & CUSTOM CLASSES
-# ==========================================
-class CustomKDE(gaussian_kde):
-    def __init__(self, dataset, bw_factor):
-        self.bw_factor = bw_factor
-        super().__init__(dataset)
-    def covariance_factor(self):
-        return super().covariance_factor() * self.bw_factor
-
-def worker_loop(task_q, result_queue):
-    import matplotlib
-    matplotlib.use('Agg')
+def csv_writer_process(queue, summary_filepath, features_filepath):
+    import pandas as pd
+    feat_cols = ['Sim_Type', 'Case', 'Archetype', 'Terminal_Status', 'Avg_P_R', 'Avg_P_D', 'Avg_C_R', 'Avg_C_D', 'Avg_Pen_R', 'Avg_Pen_D', 'Cum_V_res']
     while True:
+        msg = queue.get()
+        if msg is None:
+            break
         try:
-            job = task_q.get()
-            if job is None:  
-                break
-            job_id, command, payload = job
-            
-            if command == 'SIMULATE':
-                sim_type, case, archetype = payload
-                res, hist = run_game(sim_type, case, archetype)
-                result_queue.put((job_id, (res, hist)))
-            elif command == 'KDE_STEP':
-                x, bw, grid_min, grid_max = payload
-                try:
-                    kde = CustomKDE(x, bw)
-                    grid = np.linspace(grid_min, grid_max, 1000)
-                    density = kde.evaluate(grid)
-                    valleys_count = sum(1 for i in range(1, len(grid) - 1) if density[i] < density[i-1] and density[i] < density[i+1])
-                    max_peak = np.max(density)
-                    out = (bw, valleys_count, max_peak)
-                except Exception:
-                    out = (bw, 0, float('inf'))
-                result_queue.put((job_id, out))
-            elif command == 'PLOT_CASE':
-                case, df_slice, features_for_pca, target_dir = payload
-                out_path = render_single_case_pca(case, df_slice, features_for_pca, target_dir)
-                result_queue.put((job_id, out_path))
-            elif command == 'PLOT_CAT':
-                cat, df_slice, features_for_pca, target_dir = payload
-                out_path = render_single_category_pca(cat, df_slice, features_for_pca, target_dir)
-                result_queue.put((job_id, out_path))
-        except Exception as e:
-            result_queue.put((job_id, e))
-
-def init_persistent_workers():
-    global _task_queue, _result_queue, _workers
-    if not _workers:
-        print(f"Initializing {NUM_WORKERS} persistent background worker processes...")
-        _task_queue = multiprocessing.Queue()
-        _result_queue = multiprocessing.Queue()
-        for i in range(NUM_WORKERS):
-            p = multiprocessing.Process(target=worker_loop, args=(_task_queue, _result_queue), name=f"PersistentWorker-{i+1}")
-            p.daemon = True
-            p.start()
-            _workers.append(p)
-
-def shutdown_persistent_workers():
-    global _task_queue, _workers
-    if _workers:
-        print("Signaling background workers to shut down cleanly...")
-        for _ in range(len(_workers)):
-            _task_queue.put(None)
-        for p in _workers:
-            p.join(timeout=2.0)
-        _workers = []
-
-def run_parallel_jobs(jobs, desc="Progress"):
-    global _task_queue, _result_queue
-        
-    # Initial progress display variables
-    total_jobs = len(jobs)
-    bar_length = 30
-    bar_chars = '-' * bar_length
-    filled_length = 0
-    percentage = 0 * 100
-    completed = 0
-    
-    for idx, (command, payload) in enumerate(jobs):
-        _task_queue.put((idx, command, payload))
-        
-    results = [None] * total_jobs
-    completed = 0
-    start_time = time.time()
-
-    print(f"\r{desc}: [{bar_chars}] 0/{total_jobs} (0.0%) | Elapsed: 00:00:00 | Speed: 0.0 jobs/s", end="", flush=True)
-    
-    while completed < total_jobs:
-        try:
-            job_id, out = _result_queue.get(timeout=1)
-            results[job_id] = out
-            completed += 1
-            if completed % KDE_PROGRESSBAR_CHUNKSIZE == 0 or completed == total_jobs or total_jobs <= 100:
-                filled_length = int(round(bar_length * completed / total_jobs))
-                bar_chars = '#' * filled_length + '-' * (bar_length - filled_length)
-                percentage = (completed / total_jobs) * 100
-        except:
+            msg.to_csv(summary_filepath, mode='a', header=False, index=False)
+            msg[feat_cols].to_csv(features_filepath, mode='a', header=False, index=False)
+        except Exception:
             pass
+
+def run_games_cuda(sim_type, case=None, archetype=None, n_games=10000, queue=None):
+    """
+    Simulate n_games in parallel on GPU using PyTorch vectorized CUDA tensors.
+    Scales seamlessly to millions of simulations with minimal memory overhead.
+    """
+    device = torch.device("cuda" if HAS_CUDA else "cpu")
+
+    C_R = torch.zeros(n_games, device=device, dtype=torch.float32)
+    C_D = torch.zeros(n_games, device=device, dtype=torch.float32)
+    cum_v_res = torch.zeros(n_games, device=device, dtype=torch.float32)
+    step = torch.ones(n_games, device=device, dtype=torch.int32)
+    active = torch.ones(n_games, device=device, dtype=torch.bool)
+
+    # Initial random parameters
+    if case == 'DD':
+        case_p_R = torch.rand(n_games, device=device) * 0.5
+        case_p_D = torch.rand(n_games, device=device) * 0.5
+    elif case == 'DH':
+        case_p_R = torch.rand(n_games, device=device) * 0.5
+        case_p_D = 0.5 + torch.rand(n_games, device=device) * 0.5
+    elif case == 'HD':
+        case_p_R = 0.5 + torch.rand(n_games, device=device) * 0.5
+        case_p_D = torch.rand(n_games, device=device) * 0.5
+    elif case == 'HH':
+        case_p_R = 0.5 + torch.rand(n_games, device=device) * 0.5
+        case_p_D = 0.5 + torch.rand(n_games, device=device) * 0.5
+    else:  # 'RR' or None
+        case_p_R = torch.rand(n_games, device=device)
+        case_p_D = torch.rand(n_games, device=device)
+
+    p_R_base, p_D_base = case_p_R.clone(), case_p_D.clone()
+
+    if sim_type in [3, 4]:
+        p_R_base = torch.rand(n_games, device=device)
+        p_D_base = torch.rand(n_games, device=device)
+    elif sim_type in [5, 6]:
+        p_R_base = 0.50001 + torch.rand(n_games, device=device) * 0.49999
+        p_D_base = torch.rand(n_games, device=device)
+    elif sim_type in [7, 8]:
+        p_R_base = torch.rand(n_games, device=device)
+        p_D_base = 0.50001 + torch.rand(n_games, device=device) * 0.49999
+
+    p_R_hawk_if_H = 0.50001 + torch.rand(n_games, device=device) * 0.49999
+    p_R_hawk_if_D = torch.rand(n_games, device=device) * 0.49999
+    p_D_hawk_if_H = 0.50001 + torch.rand(n_games, device=device) * 0.49999
+    p_D_hawk_if_D = torch.rand(n_games, device=device) * 0.49999
+
+    # Running totals for means
+    sum_p_R = torch.ones(n_games, device=device)
+    sum_p_D = torch.zeros(n_games, device=device)
+    sum_pen_R = torch.ones(n_games, device=device)
+    sum_pen_D = torch.ones(n_games, device=device)
+
+    # Step 1 execution
+    dc_R = torch.rand(n_games, device=device) * MAX_COST_PER_STEP
+    dc_D = torch.rand(n_games, device=device) * MAX_COST_PER_STEP
+    contrib_R = dc_R
+    contrib_D = -dc_D
+    delta_C = (contrib_R + contrib_D) / 2.0
+
+    C_R = torch.clamp(C_R + delta_C, min=0.0)
+    C_D = torch.clamp(C_D + delta_C, min=0.0)
+    v_res = torch.clamp(PERCEIVED_VALUE - (C_R + C_D), min=0.0)
+    cum_v_res += v_res
+
+    sum_c_R = contrib_R / 2.0
+    sum_c_D = contrib_D / 2.0
+
+    prev_act_R = torch.ones(n_games, device=device, dtype=torch.bool) # 'H'
+    prev_act_D = torch.zeros(n_games, device=device, dtype=torch.bool) # 'D'
+
+    last_contrib_R = contrib_R.clone()
+    last_contrib_D = contrib_D.clone()
+
+    current_step = 1
+    while active.any() and current_step < MAX_STEPS:
+        current_step += 1
+        v_res = torch.clamp(PERCEIVED_VALUE - (C_R + C_D), min=0.0)
         
-        if completed % KDE_PROGRESSBAR_CHUNKSIZE == 0 or completed == total_jobs or total_jobs <= 100:
-            elapsed = time.time() - start_time
-            elapsed_str = time.strftime("%H:%M:%S", time.gmtime(elapsed))
-            speed = completed / elapsed if elapsed > 0 else 0
+        # Calculate environmental decay penalties
+        if sim_type >= 3 and sim_type != 9:
+            penalty = v_res / PERCEIVED_VALUE
+            if archetype == 'Equals':
+                mul_R, mul_D = penalty, penalty
+            elif archetype == 'Cowards':
+                mul_R, mul_D = penalty ** 2, penalty ** 2
+            elif archetype == 'Fools':
+                mul_R, mul_D = penalty ** 0.5, penalty ** 0.5
+            elif archetype == 'Brinksmen':
+                mul_R, mul_D = penalty, 1.0 - (1.0 - penalty) / 3.0
+            elif archetype == 'Tyrants':
+                mul_R, mul_D = 1.0 - (1.0 - penalty) / 3.0, penalty
+            else:
+                mul_R, mul_D = torch.ones_like(penalty), torch.ones_like(penalty)
+        else:
+            mul_R, mul_D = torch.ones_like(v_res), torch.ones_like(v_res)
 
-            print(f"\r{desc}: [{bar_chars}] {completed}/{total_jobs} ({percentage:.1f}%) | Elapsed: {elapsed_str} | Speed: {speed:.3f} jobs/s", end="", flush=True)
+        # Calculate current turn probabilities
+        if sim_type == 1:
+            p_R_curr = torch.rand(n_games, device=device)
+            p_D_curr = torch.rand(n_games, device=device)
+        elif sim_type == 2:
+            p_R_curr = p_R_base.clone()
+            p_D_curr = p_D_base.clone()
+        else:
+            if current_step == 2:
+                base_R, base_D = p_R_base, p_D_base
+            else:
+                if sim_type in [3, 5, 7]:
+                    base_R, base_D = p_R_base, p_D_base
+                elif sim_type in [4, 9]:
+                    base_R = torch.where(prev_act_D, p_R_hawk_if_H, p_R_hawk_if_D)
+                    base_D = torch.where(prev_act_R, p_D_hawk_if_H, p_D_hawk_if_D)
+                elif sim_type == 6:
+                    base_R = p_R_base
+                    base_D = torch.where(prev_act_R, p_D_hawk_if_H, p_D_hawk_if_D)
+                elif sim_type == 8:
+                    base_R = torch.where(prev_act_D, p_R_hawk_if_H, p_R_hawk_if_D)
+                    base_D = p_D_base
+
+            p_R_curr = torch.clamp(base_R * mul_R, min=0.01)
+            p_D_curr = torch.clamp(base_D * mul_D, min=0.01)
+
+        # Action resolution
+        act_R = torch.rand(n_games, device=device) < p_R_curr
+        act_D = torch.rand(n_games, device=device) < p_D_curr
+
+        dc_R = torch.rand(n_games, device=device) * MAX_COST_PER_STEP
+        dc_D = torch.rand(n_games, device=device) * MAX_COST_PER_STEP
+
+        contrib_R = torch.where(act_R, dc_R, -dc_R)
+        contrib_D = torch.where(act_D, dc_D, -dc_D)
+        delta_C = (contrib_R + contrib_D) / 2.0
+
+        # Accumulate metrics only for active games
+        C_R += torch.where(active, delta_C, 0.0)
+        C_R = torch.clamp(C_R, min=0.0)
+        C_D += torch.where(active, delta_C, 0.0)
+        C_D = torch.clamp(C_D, min=0.0)
+
+        v_res = torch.clamp(PERCEIVED_VALUE - (C_R + C_D), min=0.0)
+        cum_v_res += torch.where(active, v_res, 0.0)
+
+        sum_p_R += torch.where(active, p_R_curr, 0.0)
+        sum_p_D += torch.where(active, p_D_curr, 0.0)
+        sum_pen_R += torch.where(active, mul_R, 0.0)
+        sum_pen_D += torch.where(active, mul_D, 0.0)
+        sum_c_R += torch.where(active, contrib_R / 2.0, 0.0)
+        sum_c_D += torch.where(active, contrib_D / 2.0, 0.0)
+
+        last_contrib_R = torch.where(active, contrib_R, last_contrib_R)
+        last_contrib_D = torch.where(active, contrib_D, last_contrib_D)
+
+        step += torch.where(active, 1, 0)
+        prev_act_R, prev_act_D = act_R, act_D
+        active = active & ((C_R + C_D) < PERCEIVED_VALUE)
+
+    # Calculate dynamic stats dynamically without reading DataFrames
+    batch_sum_v = cum_v_res.sum().item()
+    batch_sum_v_sq = (cum_v_res ** 2).sum().item()
     
-    print()
-    return results
+    step_cpu = step.cpu().numpy()
+    survived_mask = step_cpu == MAX_STEPS
+    revolution_mask = (~survived_mask) & (last_contrib_R.cpu().numpy() > last_contrib_D.cpu().numpy())
+    
+    batch_surv = survived_mask.sum()
+    batch_rev = revolution_mask.sum()
+    batch_crack = n_games - batch_surv - batch_rev
 
-# ==========================================
-# 3. CORE SIMULATION ENGINE
-# ==========================================
+    term_status = np.full(n_games, "Crackdown", dtype=object)
+    term_status[survived_mask] = "Survived"
+    term_status[revolution_mask] = "Revolution"
+
+    df_batch = pd.DataFrame({
+        'Sim_Type': np.int8(sim_type),
+        'Case': pd.Categorical([case if case else 'Random'] * n_games),
+        'Archetype': pd.Categorical([archetype if archetype else 'None'] * n_games),
+        'Init_P_R': p_R_base.cpu().numpy().astype(np.float32),
+        'Init_P_D': p_D_base.cpu().numpy().astype(np.float32),
+        'Steps': step_cpu.astype(np.int32),
+        'Cum_V_res': cum_v_res.cpu().numpy().astype(np.float32),
+        'Terminal_Status': pd.Categorical(term_status),
+        'Avg_P_R': (sum_p_R / step).cpu().numpy().astype(np.float32),
+        'Avg_P_D': (sum_p_D / step).cpu().numpy().astype(np.float32),
+        'Avg_C_R': (sum_c_R / step).cpu().numpy().astype(np.float32),
+        'Avg_C_D': (sum_c_D / step).cpu().numpy().astype(np.float32),
+        'Avg_Pen_R': (sum_pen_R / step).cpu().numpy().astype(np.float32),
+        'Avg_Pen_D': (sum_pen_D / step).cpu().numpy().astype(np.float32)
+    })
+    
+    stats = {
+        'count': n_games,
+        'sum_v': batch_sum_v,
+        'sum_v_sq': batch_sum_v_sq,
+        'surv': int(batch_surv),
+        'rev': int(batch_rev),
+        'crack': int(batch_crack)
+    }
+
+    if queue is not None:
+        queue.put(df_batch)
+
+    return stats
+
 def run_game(sim_type, case=None, archetype=None):
     random.seed()
     C_R, C_D = 0.0, 0.0
@@ -310,7 +430,7 @@ def run_game(sim_type, case=None, archetype=None):
     v_res = PERCEIVED_VALUE - (C_R + C_D)
     cum_v_res += max(0.0, v_res)
     
-    if sim_type >= 3:
+    if sim_type >= 3 and sim_type != 9:
         next_penalty = max(0.0, v_res) / PERCEIVED_VALUE
         if archetype == 'Equals':
             next_pen_R, next_pen_D = next_penalty, next_penalty
@@ -331,7 +451,7 @@ def run_game(sim_type, case=None, archetype=None):
         step += 1
         v_res = PERCEIVED_VALUE - (C_R + C_D)
         
-        if sim_type >= 3:
+        if sim_type >= 3 and sim_type != 9:
             penalty = v_res / PERCEIVED_VALUE
             if archetype == 'Equals':
                 mul_R, mul_D = penalty, penalty
@@ -360,7 +480,7 @@ def run_game(sim_type, case=None, archetype=None):
             else:
                 if sim_type in [3, 5, 7]:
                     base_R, base_D = p_R_base, p_D_base
-                elif sim_type == 4:
+                elif sim_type in [4, 9]:
                     base_R = p_R_hawk_if_H if prev_act_D == 'H' else p_R_hawk_if_D
                     base_D = p_D_hawk_if_H if prev_act_R == 'H' else p_D_hawk_if_D
                 elif sim_type == 6:
@@ -431,747 +551,700 @@ def _run_game_task_wrapper(args):
     sim_type, case, archetype = args
     return run_game(sim_type, case, archetype)
 
+_worker_pool = None
+
+def init_persistent_workers():
+    global _worker_pool
+    if _worker_pool is None:
+        _worker_pool = multiprocessing.Pool(processes=max(1, multiprocessing.cpu_count() - 1))
+
+def shutdown_persistent_workers():
+    global _worker_pool
+    if _worker_pool is not None:
+        _worker_pool.close()
+        _worker_pool.join()
+        _worker_pool = None
+
+def format_time(seconds):
+    m, s = divmod(int(seconds), 60)
+    h, m = divmod(m, 60)
+    if h > 0: return f"{h:02d}:{m:02d}:{s:02d}"
+    return f"{m:02d}:{s:02d}"
+
+def progress_worker_process(q, total, desc="Executing"):
+    import time
+    import queue as q_module
+    start_time = time.time()
+    completed = 0
+    speed = 0
+    eta = 0
+    eta_lapsed = 0.0
+    eta_lapsed_start = 0.0
+
+    while True:
+        elapsed = time.time() - start_time
+
+        # Look for updates
+        try:
+            msg = q.get(timeout=1.0)
+            if msg == 'DONE':
+                completed = total
+                break
+            elif isinstance(msg, int):
+                completed = msg
+                speed = completed / elapsed if elapsed else 0 # Only update when new data is returned
+                eta = (total - completed) / speed if speed else 0
+                eta_lapsed_start = time.time()
+        except q_module.Empty:
+            pass
+
+        # Dynamically update Eta
+        eta_lapsed =  time.time() - eta_lapsed_start if eta_lapsed_start else 0.0
+        current_eta = max(0.0, eta - eta_lapsed)
+        
+        bar_length = 20  # Reduced to prevent terminal wrapping
+        filled = int(bar_length * completed / total) if total > 0 else 0
+        bar = '#' * filled + '-' * (bar_length - filled)
+        percent = (completed / total) * 100 if total > 0 else 0
+
+        # Shortened labels and added trailing spaces to overwrite artifacts cleanly
+        print(f"\r{desc}: [{bar}] {completed}/{total} ({percent:.1f}%) | {speed:.0f} sim/s | Ela: {format_time(elapsed)} | ETA: {format_time(current_eta)}   ", end="", flush=True)
+        
+    elapsed = time.time() - start_time
+    speed = total / elapsed if elapsed > 0 else 0
+    bar = '#' * 20
+    print(f"\r{desc}: [{bar}] {total}/{total} (100.0%) | {speed:.0f} sim/s | Ela: {format_time(elapsed)} | ETA: 00:00   \n", end="", flush=True)
+
+def run_parallel_jobs(jobs, queue, agg_stats, desc="Executing"):
+    args_list = [j[1] for j in jobs]
+    if _worker_pool:
+        total = len(args_list)
+        
+        prog_queue = multiprocessing.Manager().Queue()
+        prog_proc = multiprocessing.Process(target=progress_worker_process, args=(prog_queue, total, desc))
+        prog_proc.start()
+        
+        batch = []
+        last_put_time = time.time()
+        
+        for i, res in enumerate(_worker_pool.imap_unordered(_run_game_task_wrapper, args_list), 1):
+            result_dict, hist = res
+            batch.append(result_dict)
+            
+            # Aggregate stats without memory load
+            key = (result_dict['Sim_Type'], result_dict['Case'], result_dict['Archetype'])
+            if key not in agg_stats:
+                 agg_stats[key] = {'count':0, 'sum_v':0.0, 'sum_v_sq':0.0, 'surv':0, 'rev':0, 'crack':0}
+            
+            agg_stats[key]['count'] += 1
+            agg_stats[key]['sum_v'] += result_dict['Cum_V_res']
+            agg_stats[key]['sum_v_sq'] += result_dict['Cum_V_res']**2
+            
+            term = result_dict['Terminal_Status']
+            if term == 'Survived': agg_stats[key]['surv'] += 1
+            elif term == 'Revolution': agg_stats[key]['rev'] += 1
+            elif term == 'Crackdown': agg_stats[key]['crack'] += 1
+            
+            if len(batch) >= 10000:
+                if queue: queue.put(pd.DataFrame(batch))
+                batch = []
+            
+            curr_time = time.time()
+            if curr_time - last_put_time >= 0.5 or i == total:
+                prog_queue.put(i)
+                last_put_time = curr_time
+  
+        if batch and queue:
+            queue.put(pd.DataFrame(batch))
+            
+        prog_queue.put('DONE')
+        prog_proc.join()
+        return
+
 def run_all_simulations():
-    cases = ['DD', 'DH', 'HD', 'HH', 'RR']
-    archetypes = ['Equals', 'Cowards', 'Fools', 'Brinksmen', 'Tyrants']
-    jobs = []
-    
-    # Sim 1 (10x N_REPS)
-    for _ in range(N_REPS * 10):
-        jobs.append(('SIMULATE', (1, None, None)))
+    manager = multiprocessing.Manager()
+    queue = manager.Queue()
+
+    summary_file = os.path.join(TEMP_DIR, FILE_SUMMARY)
+    feat_file = os.path.join(TEMP_DIR, FILE_FEATURES)
+
+    summary_cols = ['Sim_Type', 'Case', 'Archetype', 'Init_P_R', 'Init_P_D', 'Steps', 'Cum_V_res', 'Terminal_Status', 'Avg_P_R', 'Avg_P_D', 'Avg_C_R', 'Avg_C_D', 'Avg_Pen_R', 'Avg_Pen_D']
+    feat_cols = ['Sim_Type', 'Case', 'Archetype', 'Terminal_Status', 'Avg_P_R', 'Avg_P_D', 'Avg_C_R', 'Avg_C_D', 'Avg_Pen_R', 'Avg_Pen_D', 'Cum_V_res']
+    pd.DataFrame(columns=summary_cols).to_csv(summary_file, index=False)
+    pd.DataFrame(columns=feat_cols).to_csv(feat_file, index=False)
+
+    writer_proc = multiprocessing.Process(target=csv_writer_process, args=(queue, summary_file, feat_file))
+    writer_proc.start()
+
+    agg_stats = {}
+
+    if HAS_CUDA:
+        print(f"CUDA GPU hardware detected: [{torch.cuda.get_device_name(0)}]")
+        print(f"Running vectorized GPU Monte Carlo simulations (Scaling N_REPS = {N_REPS})...")
         
-    # Sim 2 (N_REPS per case)
-    for case in cases:
-        for _ in range(N_REPS):
-            jobs.append(('SIMULATE', (2, case, None)))
-            
-    # Sims 3 through 8 (Standardized identical simulation volume per strategic group)
-    # Passed None for case here to strictly isolate 'RR' to Sim 2
-    for sim_type in range(3, 9):
-        for arch in archetypes:
-            for _ in range(N_REPS * 5): 
-                jobs.append(('SIMULATE', (sim_type, None, arch)))
+        cases = ['DD', 'DH', 'HD', 'HH', 'RR']
+        archetypes = ['Equals', 'Cowards', 'Fools', 'Brinksmen', 'Tyrants']
+        
+        # Calculate strict total jobs for progress bar
+        total_sims = N_REPS * 10 + len(cases) * N_REPS * 2 + 6 * len(archetypes) * N_REPS * 5
+        jobs_completed = 0
+        
+        prog_queue = manager.Queue()
+        prog_proc = multiprocessing.Process(target=progress_worker_process, args=(prog_queue, total_sims, "Executing GPU Pipeline"))
+        prog_proc.start()
+
+        def execute_gpu_batch(sim_type, case, arch, total_n):
+            nonlocal jobs_completed, agg_stats
+            chunks = []
+            MAX_GPU_BATCH = 1000000  # Avoid tensor exhaustion
+            rem = total_n
+            while rem > 0:
+                chunks.append(min(rem, MAX_GPU_BATCH))
+                rem -= chunks[-1]
+
+            for n in chunks:
+                stats = run_games_cuda(sim_type, case, arch, n, queue)
                 
-    total_tasks = len(jobs)
-    print(f"Total simulations to execute: {total_tasks}")
-    task_results = run_parallel_jobs(jobs, desc="Executing Simulations")
-    
-    results = []
-    histories = {}
-    for idx, (res, hist) in enumerate(task_results):
-        results.append(res)
-        if RECORD_HISTORY:
-            histories[idx] = hist
-            
-    df_res = pd.DataFrame(results)
-    df_hist = pd.DataFrame() 
-    return df_res, df_hist
+                key = (sim_type, case, arch)
+                if key not in agg_stats:
+                    agg_stats[key] = {'count':0, 'sum_v':0.0, 'sum_v_sq':0.0, 'surv':0, 'rev':0, 'crack':0}
+                agg_stats[key]['count'] += stats['count']
+                agg_stats[key]['sum_v'] += stats['sum_v']
+                agg_stats[key]['sum_v_sq'] += stats['sum_v_sq']
+                agg_stats[key]['surv'] += stats['surv']
+                agg_stats[key]['rev'] += stats['rev']
+                agg_stats[key]['crack'] += stats['crack']
 
-# ==========================================
-# 4. KDE VALLEY CLUSTERING IMPLEMENTATION
-# ==========================================
-def _eval_bandwidth_task(args):
-    x, bw, grid_min, grid_max = args
-    try:
-        kde = CustomKDE(x, bw)
-        grid = np.linspace(grid_min, grid_max, 1000)
-        density = kde.evaluate(grid)
-        valleys_count = sum(1 for i in range(1, len(grid) - 1) if density[i] < density[i-1] and density[i] < density[i+1])
-        max_peak = np.max(density)
-        return (bw, valleys_count, max_peak)
-    except Exception:
-        return (bw, 0, float('inf'))
+                jobs_completed += n
+                prog_queue.put(jobs_completed)
 
-def find_optimal_bandwidth(x, steps=None, top_n=KDE_TOP_N_PEAKS):
-    if steps is None:
-        steps = np.arange(KDE_OPTIMISATION_STEP, 1.0 + KDE_OPTIMISATION_STEP, KDE_OPTIMISATION_STEP)
-    if len(x) < 2 or np.all(x == x[0]) or np.var(x) < 1e-9:
-        return 0.3, CustomKDE(x, 0.3)
+        execute_gpu_batch(1, None, None, N_REPS * 10)
+        for case in cases:
+            execute_gpu_batch(2, case, None, N_REPS)
+            execute_gpu_batch(9, case, None, N_REPS)
+        for sim_type in range(3, 9):
+            for arch in archetypes:
+                execute_gpu_batch(sim_type, None, arch, N_REPS * 5)
         
-    grid_min, grid_max = x[0], x[-1]
-    
-    if multiprocessing.current_process().name == 'MainProcess' and _task_queue is not None:
-        jobs = [('KDE_STEP', (x, bw, grid_min, grid_max)) for bw in steps]
-        raw_candidates = run_parallel_jobs(jobs, desc="Finding Optimal KDE Bandwidths")
+        prog_queue.put('DONE')
+        prog_proc.join()
     else:
-        raw_candidates = [_eval_bandwidth_task((x, bw, grid_min, grid_max)) for bw in steps]
-            
-    candidates = [item for item in raw_candidates if item is not None]
-    if not candidates:
-        return 0.3, CustomKDE(x, 0.3)
-        
-    candidates.sort(key=lambda item: item[1], reverse=True)
+        print("CUDA GPU not detected. Falling back to persistent CPU worker multiprocessing...")
+        cases = ['DD', 'DH', 'HD', 'HH', 'RR']
+        archetypes = ['Equals', 'Cowards', 'Fools', 'Brinksmen', 'Tyrants']
+        jobs = []
+
+        for _ in range(N_REPS * 10): jobs.append(('SIMULATE', (1, None, None)))
+        for case in cases:
+            for _ in range(N_REPS):
+                jobs.append(('SIMULATE', (2, case, None)))
+                jobs.append(('SIMULATE', (9, case, None)))
+        for sim_type in range(3, 9):
+            for arch in archetypes:
+                for _ in range(N_REPS * 5):
+                    jobs.append(('SIMULATE', (sim_type, None, arch)))
+
+        run_parallel_jobs(jobs, queue, agg_stats, desc="Executing CPU Simulations")
+
+    print("\nFinalizing Background Write Stream...")
+    queue.put(None)
+    writer_proc.join()
     
-    if len(candidates) > KDE_EXCLUDE_TOP_N_PEAKS:
-        shortlist = candidates[KDE_EXCLUDE_TOP_N_PEAKS : KDE_EXCLUDE_TOP_N_PEAKS + top_n]
+    # Construct an aggregated DataFrame strictly for visualizations, totally sidestepping RAM constraints
+    records = []
+    for (sim, case, arch), s in agg_stats.items():
+        count = s['count']
+        if count == 0: continue
+        mean = s['sum_v'] / count
+        var = (s['sum_v_sq'] / count) - (mean ** 2)
+        std = np.sqrt(max(0, var))
+        records.append({
+            'Sim_Type': sim,
+            'Case': case if case else 'Random',
+            'Archetype': arch if arch else 'None',
+            'Mean_V_res': mean,
+            'Std_V_res': std,
+            'Total_Count': count,
+            'Crackdown_Count': s['crack'],
+            'Revolution_Count': s['rev'],
+            'Survived_Count': s['surv']
+        })
+    df_agg = pd.DataFrame(records)
+    df_agg.loc[df_agg['Sim_Type'].isin([2, 9]), 'Archetype'] = 'Control'
+
+    return df_agg, pd.DataFrame()
+
+# ==========================================
+# 4. VISUALIZATIONS
+# ==========================================
+def compute_paired_significance(sub_base, sub_t4t, metric_col):
+    if sub_base.empty or sub_t4t.empty:
+        return 1.0, "ns"
+        
+    if metric_col == 'Is_Terminated':
+        term_b = sub_base['Crackdown_Count'].values[0] + sub_base['Revolution_Count'].values[0]
+        surv_b = sub_base['Survived_Count'].values[0]
+        term_t = sub_t4t['Crackdown_Count'].values[0] + sub_t4t['Revolution_Count'].values[0]
+        surv_t = sub_t4t['Survived_Count'].values[0]
+        contingency = [[term_b, surv_b], [term_t, surv_t]]
+
+        try:
+            res = stats.chi2_contingency(contingency)
+            p_val = res.pvalue
+        except Exception:
+            _, p_val = stats.fisher_exact(contingency)
     else:
-        shortlist = candidates[:top_n]
-        
-    if not shortlist:
-        return 0.3, CustomKDE(x, 0.3)
-        
-    best_candidate = min(shortlist, key=lambda item: item[2])
-    best_bw = best_candidate[0]
-    return best_bw, CustomKDE(x, best_bw)
+        mb = sub_base['Mean_V_res'].values[0]
+        sb = sub_base['Std_V_res'].values[0]
+        nb = sub_base['Total_Count'].values[0]
+        mt = sub_t4t['Mean_V_res'].values[0]
+        st = sub_t4t['Std_V_res'].values[0]
+        nt = sub_t4t['Total_Count'].values[0]
+        if nb < 2 or nt < 2: return 1.0, "ns"
+        _, p_val = stats.ttest_ind_from_stats(mb, sb, nb, mt, st, nt, equal_var=False)
 
-def kde_valley_clustering(data, bw_adjust=KDE_BW_ADJUST, _global=False):
-    global global_actual_bw
-    x = np.sort(data)
-    if len(x) < 2 or np.all(x == x[0]) or np.var(x) < 1e-9:
-        return np.zeros(len(data), dtype=int)
-        
-    actual_bw, kde = (bw_adjust, CustomKDE(x, bw_adjust)) if bw_adjust != "dynamic" else find_optimal_bandwidth(x, top_n=KDE_TOP_N_PEAKS)
-    if _global == True:
-        global_actual_bw = actual_bw
+    if np.isnan(p_val): p_val = 1.0
+    if p_val < 0.001: return p_val, "***"
+    elif p_val < 0.01: return p_val, "**"
+    elif p_val < 0.05: return p_val, "*"
+    else: return p_val, "ns"
 
-    grid = np.linspace(x[0], x[-1], 1000)
-    density = kde.evaluate(grid)
-    
-    valleys = [grid[i] for i in range(1, len(grid) - 1) if density[i] < density[i-1] and density[i] < density[i+1]]
+def plot_sim_pair_dual_canvas(df_archetypes, sim_base, sim_t4t, pair_label, output_folder):
+    if sim_base == 2 and sim_t4t == 9:
+        x_categories = ['DD', 'DH', 'HD', 'HH', 'RR']
+        group_col = 'Case'
+        x_label = 'Starting Case Quadrant'
+    else:
+        std_order = STANDARD_ARCHETYPE_ORDER
+        detected = sorted(df_archetypes['Archetype'].unique().tolist())
+        x_categories = [a for a in std_order if a in detected and a != 'Control'] + [a for a in detected if a not in std_order and a != 'Control']
+        if 'None' in x_categories:
+            x_categories.remove('None')
+        group_col = 'Archetype'
+        x_label = 'National Archetype'
+
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 6))
+
+    n_cats = len(x_categories)
+    bar_width = 0.35
+    x_indices = np.arange(n_cats)
+
+    color_base_crack, color_base_rev = '#1f77b4', '#6baed6'
+    color_t4t_crack, color_t4t_rev = '#d95f02', '#fdbf6f'
+
+    means_base_p, stds_base_p, means_t4t_p, stds_t4t_p, sig_p = [], [], [], [], []
+    crack_base_t, rev_base_t, total_base_t = [], [], []
+    crack_t4t_t, rev_t4t_t, total_t4t_t = [], [], []
+    cnt_crack_b, cnt_rev_b, cnt_tot_b, cnt_crack_t, cnt_rev_t, cnt_tot_t, sig_t = [], [], [], [], [], [], []
+
+    for cat in x_categories:
+        sub_base = df_archetypes[(df_archetypes[group_col] == cat) & (df_archetypes['Sim_Type'] == sim_base)]
+        sub_t4t = df_archetypes[(df_archetypes[group_col] == cat) & (df_archetypes['Sim_Type'] == sim_t4t)]
+
+        if not sub_base.empty:
+            means_base_p.append(sub_base['Mean_V_res'].values[0])
+            stds_base_p.append(sub_base['Std_V_res'].values[0])
+            cb_c = sub_base['Crackdown_Count'].values[0]
+            cb_r = sub_base['Revolution_Count'].values[0]
+            n_tot_b = sub_base['Total_Count'].values[0]
+        else:
+            means_base_p.append(0.0); stds_base_p.append(0.0); cb_c = cb_r = n_tot_b = 0
+
+        if not sub_t4t.empty:
+            means_t4t_p.append(sub_t4t['Mean_V_res'].values[0])
+            stds_t4t_p.append(sub_t4t['Std_V_res'].values[0])
+            ct_c = sub_t4t['Crackdown_Count'].values[0]
+            ct_r = sub_t4t['Revolution_Count'].values[0]
+            n_tot_t = sub_t4t['Total_Count'].values[0]
+        else:
+            means_t4t_p.append(0.0); stds_t4t_p.append(0.0); ct_c = ct_r = n_tot_t = 0
             
-    if len(valleys) > 19:
-        valley_densities = kde.evaluate(valleys)
-        sorted_indices = np.argsort(valley_densities)
-        valleys = sorted([valleys[idx] for idx in sorted_indices[:19]])
-        
-    return np.digitize(data, valleys)
+        _, stars_p = compute_paired_significance(sub_base, sub_t4t, 'Cum_V_res')
+        sig_p.append(stars_p)
 
-def get_ordered_local_clusters(data_values, bw_adjust=KDE_BW_ADJUST, _global=False):
-    if len(data_values) == 0:
-        return np.array([])
-    if np.all(data_values == data_values[0]) or np.var(data_values) < 1e-9:
-        return np.zeros(len(data_values), dtype=int)
-        
-    raw_labels = kde_valley_clustering(data_values, bw_adjust=bw_adjust, _global=_global)
-    df_temp = pd.DataFrame({'val': data_values, 'raw_lbl': raw_labels})
-    means = df_temp.groupby('raw_lbl')['val'].mean().sort_values(ascending=False)
-    mapping = {old_id: new_id + 1 for new_id, old_id in enumerate(means.index)}
-    return df_temp['raw_lbl'].map(mapping).values
+        p_cb_c, p_cb_r = (cb_c / n_tot_b if n_tot_b > 0 else 0.0), (cb_r / n_tot_b if n_tot_b > 0 else 0.0)
+        p_ct_c, p_ct_r = (ct_c / n_tot_t if n_tot_t > 0 else 0.0), (ct_r / n_tot_t if n_tot_t > 0 else 0.0)
 
-# ==========================================
-# 5. DATA POST-PROCESSING & MULTIDIMENSIONAL PCA
-# ==========================================
-def process_data(df):
-    print("Performing Global KDE Valley Clustering...")
-    df['Cluster'] = [f"{int(c):02d}" for c in get_ordered_local_clusters(df['Cum_V_res'].values, bw_adjust=KDE_BW_ADJUST, _global=True)]
-    
-    sorted_unique_clusters = sorted(df['Cluster'].unique())
-    top_5_clusters = sorted_unique_clusters[:5] if len(sorted_unique_clusters) >= 5 else sorted_unique_clusters
-    
-    survival_rates = df.groupby('Cluster')['Steps'].min()
-    full_survival_clusters = survival_rates[survival_rates == MAX_STEPS].index
-    bottom_5_survival = sorted(full_survival_clusters)[:5] if len(full_survival_clusters) > 0 else []
-    termination_clusters = survival_rates[survival_rates < MAX_STEPS].index
-    
-    print("Performing Global Multi-Dimensional PCA...")
-    features_for_pca = ['Avg_P_R', 'Avg_P_D', 'Avg_C_R', 'Avg_C_D', 'Avg_Pen_R', 'Avg_Pen_D']
-    x_matrix = df[features_for_pca].values
-    x_scaled = StandardScaler().fit_transform(x_matrix)
-    
-    pca = PCA(n_components=2)
-    principal_components = pca.fit_transform(x_scaled)
-    df['PCA_1'] = principal_components[:, 0]
-    df['PCA_2'] = principal_components[:, 1]
-    
-    all_export_features = ['Avg_P_R', 'Avg_P_D', 'Avg_C_R', 'Avg_C_D', 'Avg_Pen_R', 'Avg_Pen_D', 'Cum_V_res']
-    df_pca_features = df[['Sim_Type', 'Case', 'Archetype', 'Cluster'] + all_export_features + ['PCA_1', 'PCA_2']].copy()
-    
-    return df, df_pca_features, top_5_clusters, bottom_5_survival, termination_clusters
+        crack_base_t.append(p_cb_c); rev_base_t.append(p_cb_r); total_base_t.append(p_cb_c + p_cb_r)
+        cnt_crack_b.append(cb_c); cnt_rev_b.append(cb_r); cnt_tot_b.append(n_tot_b)
+        crack_t4t_t.append(p_ct_c); rev_t4t_t.append(p_ct_r); total_t4t_t.append(p_ct_c + p_ct_r)
+        cnt_crack_t.append(ct_c); cnt_rev_t.append(ct_r); cnt_tot_t.append(n_tot_t)
+        
+        _, stars_t = compute_paired_significance(sub_base, sub_t4t, 'Is_Terminated')
+        sig_t.append(stars_t)
 
+    err_base_p = [[min(m, s) for m, s in zip(means_base_p, stds_base_p)], stds_base_p]
+    err_t4t_p = [[min(m, s) for m, s in zip(means_t4t_p, stds_t4t_p)], stds_t4t_p]
 
-# ==========================================
-# CORE PLOT RENDERING FUNCTIONS
-# ==========================================
-def render_single_case_pca(case, df_slice, features_for_pca, target_dir):
-    import matplotlib
-    matplotlib.use('Agg')
-    import matplotlib.pyplot as plt
-    import seaborn as sns
-    sns.set_theme(style="whitegrid")
-    
-    plt.figure(figsize=(8, 6))
-    if not df_slice.empty and len(df_slice) >= 5:
-        x_local = df_slice[features_for_pca].values
-        stds = np.std(x_local, axis=0)
-        stds[stds == 0] = 1.0
-        x_scaled = (x_local - np.mean(x_local, axis=0)) / stds
-        
-        pca_local = PCA(n_components=2)
-        pcs_local = pca_local.fit_transform(x_scaled)
-        
-        df_slice = df_slice.copy()
-        df_slice['Local_PCA_1'] = pcs_local[:, 0]
-        df_slice['Local_PCA_2'] = pcs_local[:, 1]
-        
-        local_lbls = get_ordered_local_clusters(df_slice['Cum_V_res'].values, bw_adjust=KDE_BW_ADJUST)
-        df_slice['Local_Cluster'] = [f"{int(l):02d}" for l in local_lbls]
-        
-        df_slice_sorted = df_slice.sort_values('Local_Cluster')
-        unique_clusters = sorted(df_slice_sorted['Local_Cluster'].unique())
-        
-        # Plot circles with NO borders
-        sns.scatterplot(
-            x='Local_PCA_1', y='Local_PCA_2', hue='Local_Cluster', hue_order=unique_clusters,
-            data=df_slice_sorted, palette='tab20', alpha=PLOT_ALPHA, s=PLOT_DOT_SIZE, marker='o',
-            edgecolor=None, linewidth=0
-        )
-        
-        terminated_runs = df_slice_sorted[df_slice_sorted['Terminal_Status'] != 'Survived']
-        if not terminated_runs.empty:
-            sns.scatterplot(
-                x='Local_PCA_1', y='Local_PCA_2', hue='Local_Cluster', hue_order=unique_clusters,
-                data=terminated_runs, palette='tab20', alpha=CROSS_ALPHA, s=PLOT_DOT_SIZE * CROSS_SIZE_RATIO, marker='x',
-                legend=False, linewidth=LINEWIDTH
-            )
-            
-        sorted_by_vres = df_slice_sorted.sort_values('Cum_V_res', ascending=False)
-        k_1pct = max(1, int(len(sorted_by_vres) * 0.01))
-        num_highlights = min(k_1pct, 100)
-        
-        # Highlight top 1% highest cumulative V_res scores with diamonds
-        top_1pct_runs = sorted_by_vres.head(num_highlights)
-        if not top_1pct_runs.empty:
-            sns.scatterplot(
-                x='Local_PCA_1', y='Local_PCA_2', hue='Local_Cluster', hue_order=unique_clusters,
-                data=top_1pct_runs, palette='tab20', alpha=DIAMOND_ALPHA, s=PLOT_DOT_SIZE * DIAMOND_SIZE_RATIO, marker='d',
-                legend=False, edgecolor='black', linewidth=LINEWIDTH
-            )
-            
-        # Highlight bottom 1% lowest cumulative V_res scores (Black crosses if terminated, transparent circles if survived)
-        bottom_1pct_runs = sorted_by_vres.tail(num_highlights)
-        bottom_terminated = bottom_1pct_runs[bottom_1pct_runs['Terminal_Status'] != 'Survived']
-        bottom_survived = bottom_1pct_runs[bottom_1pct_runs['Terminal_Status'] == 'Survived']
-        
-        if not bottom_terminated.empty:
-            plt.scatter(
-                bottom_terminated['Local_PCA_1'], bottom_terminated['Local_PCA_2'],
-                marker='x', s=PLOT_DOT_SIZE * CROSS_SIZE_RATIO, color='black', alpha=CROSS_ALPHA,
-                linewidths=LINEWIDTH, zorder=5
-            )
-            
-        if not bottom_survived.empty:
-            plt.scatter(
-                bottom_survived['Local_PCA_1'], bottom_survived['Local_PCA_2'],
-                marker='o', s=PLOT_DOT_SIZE * CROSS_SIZE_RATIO, facecolors='none', edgecolors='black', 
-                alpha=CROSS_ALPHA, linewidths=LINEWIDTH, zorder=5
-            )
-        
-    plt.title(f"Isolated PCA & Local KDE: Case {case}")
-    plt.xlabel("Principal Component 1 (Local Component)")
-    plt.ylabel("Principal Component 2 (Local Component)")
-    plt.legend(title='Local KDE Cluster', bbox_to_anchor=(1.05, 1), loc='upper left')
+    rects1_p = ax1.bar(x_indices - bar_width/2, means_base_p, bar_width, yerr=err_base_p, capsize=4,
+                       color='#2b5c8f', edgecolor='black', linewidth=0.7, label=SIM_LABELS[sim_base])
+    rects2_p = ax1.bar(x_indices + bar_width/2, means_t4t_p, bar_width, yerr=err_t4t_p, capsize=4,
+                       color='#e05d44', edgecolor='black', linewidth=0.7, label=SIM_LABELS[sim_t4t])
+
+    for rect, val in zip(rects1_p, means_base_p):
+        if val > 0:
+            ax1.text(rect.get_x() + rect.get_width()/2., val / 2., f"{val:.0f}",
+                     ha='center', va='center', color='white', fontweight='bold', fontsize=8.5, rotation=90)
+    for rect, val in zip(rects2_p, means_t4t_p):
+        if val > 0:
+            ax1.text(rect.get_x() + rect.get_width()/2., val / 2., f"{val:.0f}",
+                     ha='center', va='center', color='white', fontweight='bold', fontsize=8.5, rotation=90)
+
+    for x_i, mb, mt, sb, st, stars in zip(x_indices, means_base_p, means_t4t_p, stds_base_p, stds_t4t_p, sig_p):
+        max_height = max(mb + sb, mt + st)
+        y_pos = max_height + max_height * 0.03 + 20
+        font_color, font_weight = ('#d9534f', 'bold') if stars != 'ns' else ('#666666', 'normal')
+        ax1.text(x_i, y_pos, stars, ha='center', va='bottom', fontsize=11, color=font_color, fontweight=font_weight)
+
+    ax1.set_ylim(0, 8000)
+    ax1.set_title('(A) Prosperity Scores (Mean Cum_V_res)', fontweight='bold', fontsize=11, pad=10)
+    ax1.set_xticks(x_indices)
+    ax1.set_xticklabels(x_categories, fontweight='bold', fontsize=9.5)
+    ax1.set_xlabel(x_label, fontweight='bold')
+    ax1.set_ylabel('Mean Cum_V_res', fontweight='bold', fontsize=10)
+    ax1.grid(axis='y', linestyle='--', alpha=0.5)
+    ax1.legend(loc='upper right', frameon=True, facecolor='white', framealpha=0.9, fontsize=8.0)
+
+    x_base, x_t4t = x_indices - bar_width/2, x_indices + bar_width/2
+    ax2.bar(x_base, crack_base_t, bar_width, label=f"{SIM_LABELS[sim_base]} (Crackdown)", color=color_base_crack, edgecolor='black', linewidth=0.7)
+    ax2.bar(x_base, rev_base_t, bar_width, bottom=crack_base_t, label=f"{SIM_LABELS[sim_base]} (Revolution)", color=color_base_rev, edgecolor='black', linewidth=0.7)
+    ax2.bar(x_t4t, crack_t4t_t, bar_width, label=f"{SIM_LABELS[sim_t4t]} (Crackdown)", color=color_t4t_crack, edgecolor='black', linewidth=0.7)
+    ax2.bar(x_t4t, rev_t4t_t, bar_width, bottom=crack_t4t_t, label=f"{SIM_LABELS[sim_t4t]} (Revolution)", color=color_t4t_rev, edgecolor='black', linewidth=0.7)
+
+    for i in range(n_cats):
+        # Base Bar Labels
+        pc_b, nc_b = crack_base_t[i], cnt_crack_b[i]
+        pr_b, nr_b = rev_base_t[i], cnt_rev_b[i]
+        pt_b, nt_b = total_base_t[i], cnt_tot_b[i]
+
+        if pc_b >= 0.04:
+            ax2.text(x_base[i], pc_b / 2.0, f"{pc_b*100:.0f}%\n({nc_b})",
+                     ha='center', va='center', color='white', fontweight='bold', fontsize=6.5)
+        if pr_b >= 0.04:
+            ax2.text(x_base[i], pc_b + pr_b / 2.0, f"{pr_b*100:.0f}%\n({nr_b})",
+                     ha='center', va='center', color='#111111', fontweight='bold', fontsize=6.5)
+        if pt_b > 0:
+            ax2.text(x_base[i], pt_b + 0.01, f"{pt_b*100:.1f}%\n(n={nt_b})",
+                     ha='center', va='bottom', color='black', fontweight='bold', fontsize=7.5)
+
+        # T4T Bar Labels
+        pc_t, nc_t = crack_t4t_t[i], cnt_crack_t[i]
+        pr_t, nr_t = rev_t4t_t[i], cnt_rev_t[i]
+        pt_t, nt_t = total_t4t_t[i], cnt_tot_t[i]
+
+        if pc_t >= 0.04:
+            ax2.text(x_t4t[i], pc_t / 2.0, f"{pc_t*100:.0f}%\n({nc_t})",
+                     ha='center', va='center', color='white', fontweight='bold', fontsize=6.5)
+        if pr_t >= 0.04:
+            ax2.text(x_t4t[i], pc_t + pr_t / 2.0, f"{pr_t*100:.0f}%\n({nr_t})",
+                     ha='center', va='center', color='#111111', fontweight='bold', fontsize=6.5)
+        if pt_t > 0:
+            ax2.text(x_t4t[i], pt_t + 0.01, f"{pt_t*100:.1f}%\n(n={nt_t})",
+                     ha='center', va='bottom', color='black', fontweight='bold', fontsize=7.5)
+
+        max_h = max(total_base_t[i], total_t4t_t[i])
+        stars = sig_t[i]
+        if max_h > 0:
+            y_pos = max_h + 0.07
+            font_color, font_weight = ('#d9534f', 'bold') if stars != 'ns' else ('#666666', 'normal')
+            ax2.text(x_indices[i], y_pos, stars, ha='center', va='bottom', fontsize=11, color=font_color, fontweight=font_weight)
+
+    max_bar_val = max(max(total_base_t), max(total_t4t_t)) if total_base_t and total_t4t_t else 0.5
+    ax2.set_ylim(0, max(max_bar_val * 1.35, 0.15))
+    ax2.set_title('(B) Termination Proportions (Crackdown + Revolution)', fontweight='bold', fontsize=11, pad=10)
+    ax2.set_xticks(x_indices)
+    ax2.set_xticklabels(x_categories, fontweight='bold', fontsize=9.5)
+    ax2.set_xlabel(x_label, fontweight='bold')
+    ax2.set_ylabel('Termination Proportion (0.0 - 1.0)', fontweight='bold', fontsize=10)
+    ax2.grid(axis='y', linestyle='--', alpha=0.5)
+    ax2.legend(loc='upper left', frameon=True, facecolor='white', framealpha=0.9, fontsize=8.0)
+
+    plt.suptitle(f'Paired Analysis: {pair_label}', fontweight='bold', fontsize=13, y=1.05)
     plt.tight_layout()
-    path = os.path.join(target_dir, f"pca_case_{case}.png")
-    plt.savefig(path)
+
+    file_path = os.path.join(output_folder, f'dual_canvas_sim{sim_base}_vs_sim{sim_t4t}_archetypes.png')
+    plt.savefig(file_path, dpi=300, bbox_inches='tight')
     plt.close()
-    return path
+    return file_path
 
+def plot_cross_archetype_dual_canvas(df_archetypes, output_folder):
+    std_order = STANDARD_ARCHETYPE_ORDER
+    detected = sorted(df_archetypes['Archetype'].unique().tolist())
+    detected_archetypes = [a for a in std_order if a in detected and a != 'Control'] + [a for a in detected if a not in std_order and a != 'Control']
+    
+    if 'None' in detected_archetypes:
+        detected_archetypes.remove('None')
 
-def render_single_category_pca(cat, df_slice, features_for_pca, target_dir):
-    import matplotlib
-    matplotlib.use('Agg')
-    import matplotlib.pyplot as plt
-    import seaborn as sns
-    sns.set_theme(style="whitegrid")
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(16, 12))
+
+    n_archs = len(detected_archetypes)
+    ordered_sims = [2, 9, 3, 4, 5, 6, 7, 8]
+    n_sims = len(ordered_sims)
+    bar_width = 0.10
+    x_indices = np.arange(n_archs)
     
-    plt.figure(figsize=(8, 6))
-    
-    if cat == 'Sim_2_Control':
-        title_label = "Sim 2 (Control) Baseline"
-    else:
-        parts = cat.split('_')
-        s_num = parts[1]
-        a_name = parts[2]
-        sim_names = {
-            '3': 'Sim 3 (Neutral)', '4': 'Sim 4 (Neutral TFT)',
-            '5': 'Sim 5 (Agg Ruler)', '6': 'Sim 6 (Agg Ruler TFT)',
-            '7': 'Sim 7 (Agg Ruled)', '8': 'Sim 8 (Agg Ruled TFT)'
-        }
-        title_label = f"{sim_names[s_num]} - {a_name}"
-    
-    if not df_slice.empty and len(df_slice) >= 5:
-        x_local = df_slice[features_for_pca].values
-        stds = np.std(x_local, axis=0)
-        stds[stds == 0] = 1.0
-        x_scaled = (x_local - np.mean(x_local, axis=0)) / stds
+    cluster_width = n_sims * bar_width + 3 * 0.02
+    start_x = -cluster_width / 2 + bar_width / 2
+
+    sim_colors_crack = {
+        2: '#7570b3', 9: '#9e9ac8', 3: '#1f77b4', 4: '#3182bd',
+        5: '#d95f02', 6: '#e6550d', 7: '#2ca02c', 8: '#31a354'
+    }
+    sim_colors_rev = {
+        2: '#bcbddc', 9: '#dadaeb', 3: '#9ecae1', 4: '#c6dbef',
+        5: '#fdbf6f', 6: '#fdd0a2', 7: '#a1d99b', 8: '#e5f5e0'
+    }
+
+    all_max_heights = []
+
+    for i, sim_type in enumerate(ordered_sims):
+        pair_idx = i // 2
+        offset = start_x + i * bar_width + pair_idx * 0.02
         
-        pca_local = PCA(n_components=2)
-        pcs_local = pca_local.fit_transform(x_scaled)
-        
-        df_slice = df_slice.copy()
-        df_slice['Local_PCA_1'] = pcs_local[:, 0]
-        df_slice['Local_PCA_2'] = pcs_local[:, 1]
-        
-        local_lbls = get_ordered_local_clusters(df_slice['Cum_V_res'].values, bw_adjust=KDE_BW_ADJUST)
-        df_slice['Local_Cluster'] = [f"{int(l):02d}" for l in local_lbls]
-        
-        df_slice_sorted = df_slice.sort_values('Local_Cluster')
-        unique_clusters = sorted(df_slice_sorted['Local_Cluster'].unique())
-        
-        # Plot circles with NO borders
-        sns.scatterplot(
-            x='Local_PCA_1', y='Local_PCA_2', hue='Local_Cluster', hue_order=unique_clusters,
-            data=df_slice_sorted, palette='tab20', alpha=PLOT_ALPHA, s=PLOT_DOT_SIZE, marker='o',
-            edgecolor=None, linewidth=0
-        )
-        
-        terminated_runs = df_slice_sorted[df_slice_sorted['Terminal_Status'] != 'Survived']
-        if not terminated_runs.empty:
-            sns.scatterplot(
-                x='Local_PCA_1', y='Local_PCA_2', hue='Local_Cluster', hue_order=unique_clusters,
-                data=terminated_runs, palette='tab20', alpha=CROSS_ALPHA, s=PLOT_DOT_SIZE * CROSS_SIZE_RATIO, marker='x',
-                legend=False, linewidth=LINEWIDTH
-            )
+        means_p, stds_p = [], []
+        crack_means, rev_means, tot_means = [], [], []
+
+        for arch in detected_archetypes:
+            if sim_type in [2, 9]:
+                # Combine all cases for Sims 2 and 9 explicitly as baseline global clusters
+                sub = df_archetypes[df_archetypes['Sim_Type'] == sim_type]
+            else:
+                sub = df_archetypes[(df_archetypes['Archetype'] == arch) & (df_archetypes['Sim_Type'] == sim_type)]
             
-        sorted_by_vres = df_slice_sorted.sort_values('Cum_V_res', ascending=False)
-        k_1pct = max(1, int(len(sorted_by_vres) * 0.01))
-        num_highlights = min(k_1pct, 100)
-        
-        # Highlight top 1% highest cumulative V_res scores with diamonds
-        top_1pct_runs = sorted_by_vres.head(num_highlights)
-        if not top_1pct_runs.empty:
-            sns.scatterplot(
-                x='Local_PCA_1', y='Local_PCA_2', hue='Local_Cluster', hue_order=unique_clusters,
-                data=top_1pct_runs, palette='tab20', alpha=DIAMOND_ALPHA, s=PLOT_DOT_SIZE * DIAMOND_SIZE_RATIO, marker='d',
-                legend=False, edgecolor='black', linewidth=LINEWIDTH
-            )
+            if not sub.empty:
+                cnt_tot_n = sub['Total_Count'].sum()
+                means_p.append(sub['Mean_V_res'].mean())  # mean of means across cases
+                stds_p.append(sub['Std_V_res'].mean())
+                p_c = sub['Crackdown_Count'].sum() / cnt_tot_n if cnt_tot_n > 0 else 0.0
+                p_r = sub['Revolution_Count'].sum() / cnt_tot_n if cnt_tot_n > 0 else 0.0
+            else:
+                means_p.append(0.0); stds_p.append(0.0)
+                p_c = p_r = 0.0
+                
+            crack_means.append(p_c)
+            rev_means.append(p_r)
+            tot_means.append(p_c + p_r)
+            all_max_heights.append(p_c + p_r)
+
+        err_p = [[min(m, s) for m, s in zip(means_p, stds_p)], stds_p]
+
+        ax1.bar(x_indices + offset, means_p, bar_width, yerr=err_p, capsize=3,
+                color=sim_colors_crack[sim_type], edgecolor='black', linewidth=0.6, label=SIM_LABELS[sim_type])
+                
+        ax2.bar(x_indices + offset, crack_means, bar_width, label=f"{SIM_LABELS[sim_type]} (Crackdown)",
+                color=sim_colors_crack[sim_type], edgecolor='black', linewidth=0.6)
+        ax2.bar(x_indices + offset, rev_means, bar_width, bottom=crack_means, label=f"{SIM_LABELS[sim_type]} (Revolution)",
+                color=sim_colors_rev[sim_type], edgecolor='black', linewidth=0.6)
+
+    ax1.set_ylabel('Mean Cumulative Value (Cum_V_res)', fontweight='bold')
+    ax1.set_xlabel('National Archetype', fontweight='bold')
+    ax1.set_title('(A) Prosperity Scores across Archetypes (All Sims)', fontweight='bold', pad=10)
+    ax1.set_xticks(x_indices)
+    ax1.set_xticklabels(detected_archetypes, fontweight='bold', fontsize=10)
+    ax1.grid(axis='y', linestyle='--', alpha=0.5)
+    ax1.legend(title='Simulation Framework', loc='center left', bbox_to_anchor=(1.01, 0.5), frameon=True, facecolor='white', framealpha=0.9, fontsize=7.5)
+
+    max_h = max(all_max_heights) if all_max_heights else 0.5
+    ax2.set_ylim(0, max(max_h * 1.35, 0.15))
+    ax2.set_ylabel('Termination Proportion (Crackdown + Revolution)', fontweight='bold')
+    ax2.set_xlabel('National Archetype', fontweight='bold')
+    ax2.set_title('(B) Stacked Termination Proportions across Archetypes (All Sims)', fontweight='bold', pad=10)
+    ax2.set_xticks(x_indices)
+    ax2.set_xticklabels(detected_archetypes, fontweight='bold', fontsize=10)
+    ax2.grid(axis='y', linestyle='--', alpha=0.5)
+    ax2.legend(title='Simulation Framework & Outcome', loc='center left', bbox_to_anchor=(1.01, 0.5), fontsize=7.5, framealpha=0.9)
+
+    plt.suptitle('Consolidated Overview: Prosperity vs. Societal Stability across Archetypes', fontweight='bold', fontsize=14, y=1.05)
+    plt.tight_layout(rect=[0, 0, 0.85, 1])
+
+    file_path = os.path.join(output_folder, 'dual_canvas_all_sims_cross_archetype.png')
+    plt.savefig(file_path, dpi=300, bbox_inches='tight')
+    plt.close()
+    return file_path
+
+def plot_individual_archetype_dual_canvas(df_archetypes, archetype_name, output_folder):
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 6))
+
+    pair_labels = ['Control\n(Sim 2 vs 9)', 'Neutral\n(Sim 3 vs 4)', 'Agg Ruler\n(Sim 5 vs 6)', 'Agg Ruled\n(Sim 7 vs 8)']
+    n_pairs = len(SIM_PAIRS)
+    bar_width = 0.35
+    x_indices = np.arange(n_pairs)
+
+    color_base_crack, color_base_rev = '#1f77b4', '#6baed6'
+    color_t4t_crack, color_t4t_rev = '#d95f02', '#fdbf6f'
+
+    means_base_p, stds_base_p, means_t4t_p, stds_t4t_p, sig_p = [], [], [], [], []
+    crack_base_t, rev_base_t, total_base_t = [], [], []
+    crack_t4t_t, rev_t4t_t, total_t4t_t = [], [], []
+    cnt_crack_b, cnt_rev_b, cnt_tot_b = [], [], []
+    cnt_crack_t, cnt_rev_t, cnt_tot_t = [], [], []
+    sig_t = []
+
+    for sim_base, sim_t4t, _ in SIM_PAIRS:
+        # Sums/means over potential cases
+        if sim_base == 2 and sim_t4t == 9:
+            sub_base = df_archetypes[df_archetypes['Sim_Type'] == 2]
+            sub_t4t = df_archetypes[df_archetypes['Sim_Type'] == 9]
+        else:
+            sub_base = df_archetypes[(df_archetypes['Archetype'] == archetype_name) & (df_archetypes['Sim_Type'] == sim_base)]
+            sub_t4t = df_archetypes[(df_archetypes['Archetype'] == archetype_name) & (df_archetypes['Sim_Type'] == sim_t4t)]
+
+        # Consolidate baseline case groupings
+        if not sub_base.empty:
+            mb = sub_base['Mean_V_res'].mean()
+            sb = sub_base['Std_V_res'].mean()
+            means_base_p.append(mb)
+            stds_base_p.append(sb)
+            n_tot_b = sub_base['Total_Count'].sum()
+            cb_c = sub_base['Crackdown_Count'].sum()
+            cb_r = sub_base['Revolution_Count'].sum()
+        else:
+            means_base_p.append(0.0); stds_base_p.append(0.0); cb_c = cb_r = n_tot_b = 0
             
-        # Highlight bottom 1% lowest cumulative V_res scores
-        bottom_1pct_runs = sorted_by_vres.tail(num_highlights)
-        bottom_terminated = bottom_1pct_runs[bottom_1pct_runs['Terminal_Status'] != 'Survived']
-        bottom_survived = bottom_1pct_runs[bottom_1pct_runs['Terminal_Status'] == 'Survived']
-        
-        if not bottom_terminated.empty:
-            plt.scatter(
-                bottom_terminated['Local_PCA_1'], bottom_terminated['Local_PCA_2'],
-                marker='x', s=PLOT_DOT_SIZE * CROSS_SIZE_RATIO, color='black', alpha=CROSS_ALPHA,
-                linewidths=LINEWIDTH, zorder=5
-            )
+        if not sub_t4t.empty:
+            mt = sub_t4t['Mean_V_res'].mean()
+            st = sub_t4t['Std_V_res'].mean()
+            means_t4t_p.append(mt)
+            stds_t4t_p.append(st)
+            n_tot_t = sub_t4t['Total_Count'].sum()
+            ct_c = sub_t4t['Crackdown_Count'].sum()
+            ct_r = sub_t4t['Revolution_Count'].sum()
+        else:
+            means_t4t_p.append(0.0); stds_t4t_p.append(0.0); ct_c = ct_r = n_tot_t = 0
             
-        if not bottom_survived.empty:
-            plt.scatter(
-                bottom_survived['Local_PCA_1'], bottom_survived['Local_PCA_2'],
-                marker='o', s=PLOT_DOT_SIZE * CROSS_SIZE_RATIO, facecolors='none', edgecolors='black', 
-                alpha=CROSS_ALPHA, linewidths=LINEWIDTH, zorder=5
-            )
+        _, stars_p = compute_paired_significance(sub_base, sub_t4t, 'Cum_V_res')
+        sig_p.append(stars_p)
+
+        p_cb_c = (cb_c / n_tot_b) if n_tot_b > 0 else 0.0
+        p_cb_r = (cb_r / n_tot_b) if n_tot_b > 0 else 0.0
+        p_ct_c = (ct_c / n_tot_t) if n_tot_t > 0 else 0.0
+        p_ct_r = (ct_r / n_tot_t) if n_tot_t > 0 else 0.0
+
+        crack_base_t.append(p_cb_c); rev_base_t.append(p_cb_r); total_base_t.append(p_cb_c + p_cb_r)
+        cnt_crack_b.append(cb_c); cnt_rev_b.append(cb_r); cnt_tot_b.append(n_tot_b)
         
-    plt.title(f"Isolated PCA: {title_label}")
-    plt.xlabel("Principal Component 1 (Local Component)")
-    plt.ylabel("Principal Component 2 (Local Component)")
-    plt.legend(title='Local KDE Cluster', bbox_to_anchor=(1.05, 1), loc='upper left')
+        crack_t4t_t.append(p_ct_c); rev_t4t_t.append(p_ct_r); total_t4t_t.append(p_ct_c + p_ct_r)
+        cnt_crack_t.append(ct_c); cnt_rev_t.append(ct_r); cnt_tot_t.append(n_tot_t)
+        
+        _, stars_t = compute_paired_significance(sub_base, sub_t4t, 'Is_Terminated')
+        sig_t.append(stars_t)
+
+    err_base_p = [[min(m, s) for m, s in zip(means_base_p, stds_base_p)], stds_base_p]
+    err_t4t_p = [[min(m, s) for m, s in zip(means_t4t_p, stds_t4t_p)], stds_t4t_p]
+
+    rects1_p = ax1.bar(x_indices - bar_width/2, means_base_p, bar_width, yerr=err_base_p, capsize=4, color='#2b5c8f', edgecolor='black', linewidth=0.7, label="Base Simulation")
+    rects2_p = ax1.bar(x_indices + bar_width/2, means_t4t_p, bar_width, yerr=err_t4t_p, capsize=4, color='#e05d44', edgecolor='black', linewidth=0.7, label="T4T Simulation")
+
+    for rect, val in zip(rects1_p, means_base_p):
+        if val > 0:
+            ax1.text(rect.get_x() + rect.get_width()/2., val / 2., f"{val:.0f}",
+                     ha='center', va='center', color='white', fontweight='bold', fontsize=8.5, rotation=90)
+    for rect, val in zip(rects2_p, means_t4t_p):
+        if val > 0:
+            ax1.text(rect.get_x() + rect.get_width()/2., val / 2., f"{val:.0f}",
+                     ha='center', va='center', color='white', fontweight='bold', fontsize=8.5, rotation=90)
+
+    for x_i, mb, mt, sb, st, stars in zip(x_indices, means_base_p, means_t4t_p, stds_base_p, stds_t4t_p, sig_p):
+        y_pos = max(mb + sb, mt + st) * 1.03 + 20
+        font_color, font_weight = ('#d9534f', 'bold') if stars != 'ns' else ('#666666', 'normal')
+        ax1.text(x_i, y_pos, stars, ha='center', va='bottom', fontsize=11, color=font_color, fontweight=font_weight)
+
+    ax1.set_ylim(0, 8000)
+    ax1.set_title('(A) Prosperity Scores (Mean Cum_V_res)', fontweight='bold', fontsize=11, pad=10)
+    ax1.set_xticks(x_indices)
+    ax1.set_xticklabels(pair_labels, fontweight='bold', fontsize=9.5)
+    ax1.set_ylabel('Mean Cum_V_res', fontweight='bold', fontsize=10)
+    ax1.grid(axis='y', linestyle='--', alpha=0.5)
+    ax1.legend(loc='upper right', frameon=True, facecolor='white', framealpha=0.9, fontsize=8.0)
+
+    x_base, x_t4t = x_indices - bar_width/2, x_indices + bar_width/2
+    ax2.bar(x_base, crack_base_t, bar_width, label="Base Simulation (Crackdown)", color=color_base_crack, edgecolor='black', linewidth=0.7)
+    ax2.bar(x_base, rev_base_t, bar_width, bottom=crack_base_t, label="Base Simulation (Revolution)", color=color_base_rev, edgecolor='black', linewidth=0.7)
+    ax2.bar(x_t4t, crack_t4t_t, bar_width, label="T4T Simulation (Crackdown)", color=color_t4t_crack, edgecolor='black', linewidth=0.7)
+    ax2.bar(x_t4t, rev_t4t_t, bar_width, bottom=crack_t4t_t, label="T4T Simulation (Revolution)", color=color_t4t_rev, edgecolor='black', linewidth=0.7)
+
+    for i in range(n_pairs):
+        # Base Bar Labels
+        pc_b, nc_b = crack_base_t[i], cnt_crack_b[i]
+        pr_b, nr_b = rev_base_t[i], cnt_rev_b[i]
+        pt_b, nt_b = total_base_t[i], cnt_tot_b[i]
+
+        if pc_b >= 0.04:
+            ax2.text(x_base[i], pc_b / 2.0, f"{pc_b*100:.0f}%\n({nc_b})",
+                     ha='center', va='center', color='white', fontweight='bold', fontsize=6.5)
+        if pr_b >= 0.04:
+            ax2.text(x_base[i], pc_b + pr_b / 2.0, f"{pr_b*100:.0f}%\n({nr_b})",
+                     ha='center', va='center', color='#111111', fontweight='bold', fontsize=6.5)
+        if pt_b > 0:
+            ax2.text(x_base[i], pt_b + 0.01, f"{pt_b*100:.1f}%\n(n={nt_b})",
+                     ha='center', va='bottom', color='black', fontweight='bold', fontsize=7.5)
+
+        # T4T Bar Labels
+        pc_t, nc_t = crack_t4t_t[i], cnt_crack_t[i]
+        pr_t, nr_t = rev_t4t_t[i], cnt_rev_t[i]
+        pt_t, nt_t = total_t4t_t[i], cnt_tot_t[i]
+
+        if pc_t >= 0.04:
+            ax2.text(x_t4t[i], pc_t / 2.0, f"{pc_t*100:.0f}%\n({nc_t})",
+                     ha='center', va='center', color='white', fontweight='bold', fontsize=6.5)
+        if pr_t >= 0.04:
+            ax2.text(x_t4t[i], pc_t + pr_t / 2.0, f"{pr_t*100:.0f}%\n({nr_t})",
+                     ha='center', va='center', color='#111111', fontweight='bold', fontsize=6.5)
+        if pt_t > 0:
+            ax2.text(x_t4t[i], pt_t + 0.01, f"{pt_t*100:.1f}%\n(n={nt_t})",
+                     ha='center', va='bottom', color='black', fontweight='bold', fontsize=7.5)
+
+        max_h = max(total_base_t[i], total_t4t_t[i])
+        stars = sig_t[i]
+        if max_h > 0:
+            font_color, font_weight = ('#d9534f', 'bold') if stars != 'ns' else ('#666666', 'normal')
+            ax2.text(x_indices[i], max_h + 0.07, stars, ha='center', va='bottom', fontsize=11, color=font_color, fontweight=font_weight)
+
+    max_bar_val = max(max(total_base_t), max(total_t4t_t)) if total_base_t and total_t4t_t else 0.5
+    ax2.set_ylim(0, max(max_bar_val * 1.35, 0.15))
+    ax2.set_title('(B) Termination Proportions (Crackdown + Revolution)', fontweight='bold', fontsize=11, pad=10)
+    ax2.set_xticks(x_indices)
+    ax2.set_xticklabels(pair_labels, fontweight='bold', fontsize=9.5)
+    ax2.set_ylabel('Termination Proportion (0.0 - 1.0)', fontweight='bold', fontsize=10)
+    ax2.grid(axis='y', linestyle='--', alpha=0.5)
+    ax2.legend(loc='upper left', frameon=True, facecolor='white', framealpha=0.9, fontsize=8.0)
+
+    plt.suptitle(f'Archetype Paired Analysis: {archetype_name}', fontweight='bold', fontsize=13, y=1.05)
     plt.tight_layout()
-    path = os.path.join(target_dir, f"pca_cat_{cat}.png")
-    plt.savefig(path)
+
+    file_path = os.path.join(output_folder, f'dual_canvas_archetype_{archetype_name.lower()}.png')
+    plt.savefig(file_path, dpi=300, bbox_inches='tight')
     plt.close()
-    return path
+    return file_path
 
-
-# ==========================================
-# 6. VISUALIZATIONS
-# ==========================================
-def generate_graphs(df, top_5, bottom_5_surv, term_clusters, target_dir):
+def generate_graphs(df, target_dir):
     os.makedirs(target_dir, exist_ok=True)
     images = []
     sns.set_theme(style="whitegrid")
     
-    features_for_pca = ['Avg_P_R', 'Avg_P_D', 'Avg_C_R', 'Avg_C_D', 'Avg_Pen_R', 'Avg_Pen_D']
-    
-    print("Generating Unified Archetypes PCA Plot...")
-    plt.figure(figsize=(10, 7))
-    unique_archetypes = sorted(df[df['Archetype'] != 'None']['Archetype'].unique())
-    sns.scatterplot(
-        x='PCA_1', y='PCA_2', hue='Archetype', hue_order=unique_archetypes, style='Archetype',
-        data=df[df['Archetype'] != 'None'], palette=PLOT_PALETTE_UNIFIED, alpha=PLOT_ALPHA, s=PLOT_DOT_SIZE, marker='o',
-        edgecolor=None, linewidth=0
-    )
-    
-    unified_terminated = df[(df['Archetype'] != 'None') & (df['Terminal_Status'] != 'Survived')]
-    if not unified_terminated.empty:
-        sns.scatterplot(
-            x='PCA_1', y='PCA_2', hue='Archetype', hue_order=unique_archetypes,
-            data=unified_terminated, palette=PLOT_PALETTE_UNIFIED, alpha=CROSS_ALPHA, s=PLOT_DOT_SIZE * CROSS_SIZE_RATIO, marker='x',
-            legend=False, linewidth=LINEWIDTH
-        )
+    print("Generating Dual-Metric Canvas Plots (Base vs TFT)...")
+    for sim_base, sim_t4t, pair_label in SIM_PAIRS:
+        p = plot_sim_pair_dual_canvas(df, sim_base, sim_t4t, pair_label, target_dir)
+        images.append(p)
         
-    sorted_by_vres_global = df[df['Archetype'] != 'None'].sort_values('Cum_V_res', ascending=False)
-    k_global = max(1, int(len(sorted_by_vres_global) * 0.01))
-    num_global_highlights = min(k_global, 100)
+    print("Generating Vertically Stacked Cross-Archetype Overview...")
+    p_cross = plot_cross_archetype_dual_canvas(df, target_dir)
+    images.append(p_cross)
     
-    # Highlighting elite top performers
-    top_1pct_global = sorted_by_vres_global.head(num_global_highlights)
-    if not top_1pct_global.empty:
-        sns.scatterplot(
-            x='PCA_1', y='PCA_2', hue='Archetype', hue_order=unique_archetypes,
-            data=top_1pct_global, palette=PLOT_PALETTE_UNIFIED, alpha=DIAMOND_ALPHA, s=PLOT_DOT_SIZE * DIAMOND_SIZE_RATIO, marker='d',
-            legend=False, edgecolor='black', linewidth=LINEWIDTH
-        )
-        
-    # Highlighting worst performers globally
-    bottom_1pct_global = sorted_by_vres_global.tail(num_global_highlights)
-    bottom_term_global = bottom_1pct_global[bottom_1pct_global['Terminal_Status'] != 'Survived']
-    bottom_surv_global = bottom_1pct_global[bottom_1pct_global['Terminal_Status'] == 'Survived']
-    
-    if not bottom_term_global.empty:
-        plt.scatter(
-            bottom_term_global['PCA_1'], bottom_term_global['PCA_2'],
-            marker='x', s=PLOT_DOT_SIZE * CROSS_SIZE_RATIO, color='black', alpha=CROSS_ALPHA,
-            linewidths=LINEWIDTH, zorder=5
-        )
-        
-    if not bottom_surv_global.empty:
-        plt.scatter(
-            bottom_surv_global['PCA_1'], bottom_surv_global['PCA_2'],
-            marker='o', s=PLOT_DOT_SIZE * CROSS_SIZE_RATIO, facecolors='none', edgecolors='black', 
-            alpha=CROSS_ALPHA, linewidths=LINEWIDTH, zorder=5
-        )
-        
-    plt.title("PCA of Simulations: National Archetypes Projected")
-    plt.xlabel("Principal Component 1")
-    plt.ylabel("Principal Component 2")
-    plt.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
-    plt.tight_layout()
-    pca_uni_path = os.path.join(target_dir, "pca_unified_archetypes.png")
-    plt.savefig(pca_uni_path)
-    images.append(pca_uni_path)
-    plt.close()
+    print("Generating Individual Archetype Dual Canvases...")
+    for arch in STANDARD_ARCHETYPE_ORDER:
+        if arch in df['Archetype'].unique() and arch != 'Control':
+            p_arch = plot_individual_archetype_dual_canvas(df, arch, target_dir)
+            images.append(p_arch)
 
-    # Parallel Rendering
-    plot_jobs = []
-    cases = ['DD', 'DH', 'HD', 'HH', 'RR']
-    for case in cases:
-        case_slice = df[df['Case'] == case].copy()
-        plot_jobs.append(('PLOT_CASE', (case, case_slice, features_for_pca, target_dir)))
-        
-    archetypes = ['Equals', 'Cowards', 'Fools', 'Brinksmen', 'Tyrants']
-    
-    cat_slice_ctrl = df[df['Sim_Type'] == 2].copy()
-    plot_jobs.append(('PLOT_CAT', ('Sim_2_Control', cat_slice_ctrl, features_for_pca, target_dir)))
-    
-    for sim_type in range(3, 9):
-        for arch in archetypes:
-            cat_label = f"Sim_{sim_type}_{arch}"
-            cat_slice = df[(df['Sim_Type'] == sim_type) & (df['Archetype'] == arch)].copy()
-            plot_jobs.append(('PLOT_CAT', (cat_label, cat_slice, features_for_pca, target_dir)))
-        
-    rendered_paths_list = run_parallel_jobs(plot_jobs, desc="Rendering PCA Plots")
-    
-    rendered_paths = {}
-    job_idx = 0
-    for case in cases:
-        rendered_paths[('case', case)] = rendered_paths_list[job_idx]
-        job_idx += 1
-        
-    rendered_paths[('category', 'Sim_2_Control')] = rendered_paths_list[job_idx]
-    job_idx += 1
-    
-    for sim_type in range(3, 9):
-        for arch in archetypes:
-            rendered_paths[('category', f"Sim_{sim_type}_{arch}")] = rendered_paths_list[job_idx]
-            job_idx += 1
-
-    for case in cases:
-        images.append(rendered_paths[('case', case)])
-
-    print("Generating Complete Cluster Abundance Plots for all simulations...")
-    for sim_type in range(1, 9):
-        df_sim = df[df['Sim_Type'] == sim_type].copy()
-        local_lbls = get_ordered_local_clusters(df_sim['Cum_V_res'].values, bw_adjust=KDE_BW_ADJUST)
-        df_sim['Local_Cluster'] = [f"{int(l):02d}" for l in local_lbls]
-        df_sim_sorted = df_sim.sort_values('Local_Cluster')
-        
-        plt.figure(figsize=(12, 6))
-        if sim_type == 1:
-            try:
-                ax = sns.countplot(x='Local_Cluster', data=df_sim_sorted, palette='viridis', hue='Local_Cluster')
-                if ax.get_legend() is not None:
-                    ax.get_legend().remove()
-            except Exception:
-                ax = sns.countplot(x='Local_Cluster', data=df_sim_sorted, palette='viridis')
-            plt.title(f"Simulation {sim_type} Complete Cluster Abundance")
-        elif sim_type == 2:
-            sns.countplot(x='Local_Cluster', data=df_sim_sorted, color='skyblue')
-            plt.title(f"Simulation {sim_type} Complete Cluster Abundance")
-        else:
-            sns.countplot(x='Local_Cluster', hue='Archetype', data=df_sim_sorted, palette='Set2')
-            plt.title(f"Simulation {sim_type} Cluster Abundance by Archetype")
-            plt.legend(title='Archetype', bbox_to_anchor=(1.05, 1), loc='upper left')
-            
-        plt.xlabel("Local KDE Cluster ID")
-        plt.ylabel("Number of Simulations")
-        plt.tight_layout()
-        sim_path = os.path.join(target_dir, f"abundance_sim{sim_type}.png")
-        plt.savefig(sim_path)
-        images.append(sim_path)
-        plt.close()
-
-    def plot_stacked_terminations_no_survival(df_subset, group_col, title, filename, expected_categories=None, figsize=(10,6), rotation=0):
-        if expected_categories is None:
-            expected_categories = sorted(df_subset[group_col].dropna().unique())
-            
-        counts = pd.crosstab(df_subset[group_col], df_subset['Terminal_Status'])
-        counts = counts.reindex(expected_categories, fill_value=0)
-        for col in ['Survived', 'Revolution', 'Crackdown']:
-            if col not in counts.columns: counts[col] = 0
-                
-        row_sums = counts.sum(axis=1) 
-        props = counts.div(row_sums, axis=0).fillna(0) * 100
-        props_to_plot = props[['Revolution', 'Crackdown']]
-        counts_to_plot = counts[['Revolution', 'Crackdown']]
-        
-        plt.figure(figsize=figsize)
-        ax = plt.gca()
-        props_to_plot.plot(kind='bar', stacked=True, color=['#e74c3c', '#2980b9'], edgecolor='black', ax=ax)
-        
-        new_labels = []
-        for cat in expected_categories:
-            sz = row_sums[cat]
-            new_labels.append(f"{cat}\n(N={sz})")
-        ax.set_xticklabels(new_labels, rotation=rotation, ha='center' if rotation==0 else 'right')
-        
-        n_info = f"N = {row_sums.iloc[0]} per category" if len(row_sums.unique()) == 1 else "N varies (see labels)"
-        plt.title(f"{title}\n({n_info} | Heights represent Total Failure %)")
-        plt.xlabel(group_col)
-        plt.ylabel("Proportion of Total State Failures (%)")
-        
-        legend_elements = [
-            Patch(facecolor='#e74c3c', edgecolor='black', label='Revolution'),
-            Patch(facecolor='#2980b9', edgecolor='black', label='Crackdown')
-        ]
-        ax.legend(handles=legend_elements, title="Termination Driver", bbox_to_anchor=(1.05, 1), loc='upper left')
-        
-        for c_idx, col in enumerate(props_to_plot.columns):
-            for r_idx, row in enumerate(props_to_plot.index):
-                val = counts_to_plot.loc[row, col]
-                if val > 0:
-                    y_pos = props_to_plot.iloc[r_idx, :c_idx].sum() + props_to_plot.loc[row, col] / 2.0
-                    ax.text(r_idx, y_pos, f"{int(val)}", ha='center', va='center', color='white', fontweight='bold', fontsize=9)
-        
-        plt.ylim(0, max(props_to_plot.sum(axis=1).max() * 1.15, 15))
-        plt.tight_layout()
-        path = os.path.join(target_dir, filename)
-        plt.savefig(path)
-        plt.close()
-        return path
-
-    print("Generating Failure proportions by simulation type...")
-    df_sim_labeled = df.copy()
-    df_sim_labeled['Simulation'] = df_sim_labeled['Sim_Type'].apply(lambda x: f"Sim {x}")
-    path_term_sim = plot_stacked_terminations_no_survival(
-        df_sim_labeled, 'Simulation', "State Failures by Simulation Framework", 
-        "termination_proportions_sim.png", expected_categories=[f"Sim {i}" for i in range(1, 9)]
-    )
-    images.append(path_term_sim)
-
-    print("Generating Failure proportions by starting quadrant...")
-    df_cases_only = df[(df['Sim_Type'] == 2) & df['Case'].isin(cases)].copy()
-    path_term_case = plot_stacked_terminations_no_survival(
-        df_cases_only, 'Case', "State Failures by Case Quadrant", 
-        "termination_proportions_case.png", expected_categories=cases
-    )
-    images.append(path_term_case)
-
-    print("Generating Failure proportions by strategic category (Multi-panel)...")
-    df_cat = df[df['Sim_Type'] >= 2].copy()
-    fig, axes = plt.subplots(2, 3, figsize=(20, 12), sharey=True)
-    archetypes_for_plot = ['Control', 'Equals', 'Cowards', 'Fools', 'Brinksmen', 'Tyrants']
-    
-    sim_labels = {
-        2: 'Sim 2\nControl',
-        3: 'Sim 3\nNeutral',
-        4: 'Sim 4\nNeutral TFT',
-        5: 'Sim 5\nAgg Ruler',
-        6: 'Sim 6\nAgg Ruler TFT',
-        7: 'Sim 7\nAgg Ruled',
-        8: 'Sim 8\nAgg Ruled TFT'
-    }
-    
-    for idx, (ax, arch) in enumerate(zip(axes.flatten(), archetypes_for_plot)):
-        if arch == 'Control':
-            df_sub = df_cat[df_cat['Sim_Type'] == 2].copy()
-            expected_cats = [2]
-        else:
-            df_sub = df_cat[(df_cat['Sim_Type'] >= 3) & (df_cat['Archetype'] == arch)].copy()
-            expected_cats = [3, 4, 5, 6, 7, 8]
-            
-        counts = pd.crosstab(df_sub['Sim_Type'], df_sub['Terminal_Status'])
-        counts = counts.reindex(expected_cats, fill_value=0)
-        
-        for col in ['Survived', 'Revolution', 'Crackdown']:
-            if col not in counts.columns: counts[col] = 0
-            
-        row_sums = counts.sum(axis=1)
-        props = counts.div(row_sums, axis=0).fillna(0) * 100
-        props_to_plot = props[['Revolution', 'Crackdown']]
-        counts_to_plot = counts[['Revolution', 'Crackdown']]
-        
-        props_to_plot.plot(kind='bar', stacked=True, color=['#e74c3c', '#2980b9'], edgecolor='black', ax=ax, legend=False)
-        
-        new_labels = [f"{sim_labels[cat]}\n(N={row_sums[cat]})" for cat in expected_cats]
-        ax.set_xticklabels(new_labels, rotation=0, ha='center')
-        
-        ax.set_title(f"Archetype: {arch}", fontweight='bold')
-        ax.set_xlabel("")
-        if ax in axes[:, 0]:
-            ax.set_ylabel("Proportion of Total State Failures (%)")
-            
-        for c_idx, col in enumerate(props_to_plot.columns):
-            for r_idx, row in enumerate(props_to_plot.index):
-                val = counts_to_plot.loc[row, col]
-                if val > 0:
-                    y_pos = props_to_plot.iloc[r_idx, :c_idx].sum() + props_to_plot.loc[row, col] / 2.0
-                    ax.text(r_idx, y_pos, f"{int(val)}", ha='center', va='center', color='white', fontweight='bold', fontsize=9)
-                    
-    legend_elements = [
-        Patch(facecolor='#e74c3c', edgecolor='black', label='Revolution'),
-        Patch(facecolor='#2980b9', edgecolor='black', label='Crackdown')
-    ]
-    fig.legend(handles=legend_elements, title="Termination Driver", bbox_to_anchor=(0.5, 1.05), loc='center', ncol=2, fontsize=12, title_fontsize=14)
-    
-    plt.tight_layout(rect=[0, 0, 1, 0.95])
-    path_term_cat = os.path.join(target_dir, "termination_proportions_category.png")
-    plt.savefig(path_term_cat)
-    plt.close()
-    images.append(path_term_cat)
-
-    return images, rendered_paths
-
-def safe_barplot(ax, x, y, hue, data, palette, hue_order=None):
-    try:
-        sns.barplot(x=x, y=y, hue=hue, data=data, palette=palette, hue_order=hue_order, capsize=0.1, errorbar='sd', ax=ax)
-    except Exception:
-        try:
-            sns.barplot(x=x, y=y, hue=hue, data=data, palette=palette, hue_order=hue_order, capsize=0.1, ci='sd', ax=ax)
-        except Exception:
-            sns.barplot(x=x, y=y, hue=hue, data=data, palette=palette, hue_order=hue_order, ax=ax)
+    return images
 
 # ==========================================
-# 7. PERFORMANCE BAR GRAPHS (TOP/BOTTOM 5)
+# 5. REPORT & ARCHIVE GENERATION
 # ==========================================
-def generate_performance_graphs(df, target_dir):
-    os.makedirs(target_dir, exist_ok=True)
-    perf_images = []
-    
-    archetypes = ['Equals', 'Cowards', 'Fools', 'Brinksmen', 'Tyrants']
-    cases = ['DD', 'DH', 'HD', 'HH', 'RR']
-    
-    custom_color_map = {
-        'Sim 3 Neutral': '#1f77b4',        
-        'Sim 4 Neutral TFT': '#aec7e8',    
-        'Sim 5 Agg Ruler': '#ff7f0e',      
-        'Sim 6 Agg Ruler TFT': '#ffbb78',  
-        'Sim 7 Agg Ruled': '#d62728',      
-        'Sim 8 Agg Ruled TFT': '#ff9896',  
-        'Sim 2 Control': '#7f7f7f'         
-    }
-    
-    for extremity in ['Top', 'Bottom']:
-        data_records = []
-        ascending_order = True if extremity == 'Bottom' else False
-        
-        for sim_type in range(3, 9):
-            sim_label = {3:'Sim 3 Neutral', 4:'Sim 4 Neutral TFT', 5:'Sim 5 Agg Ruler', 6:'Sim 6 Agg Ruler TFT', 7:'Sim 7 Agg Ruled', 8:'Sim 8 Agg Ruled TFT'}[sim_type]
-            for arch in archetypes:
-                df_sub = df[(df['Sim_Type'] == sim_type) & (df['Archetype'] == arch)]
-                top_perf = df_sub.sort_values('Cum_V_res', ascending=ascending_order).head(N_PERFORMERS)
-                for _, row in top_perf.iterrows():
-                    data_records.append({
-                        'Archetype': arch, 'Simulation': sim_label,
-                        'Ruler P_H': row['Avg_P_R'], 'Ruled P_H': row['Avg_P_D'],
-                        'Ruler Cost': row['Avg_C_R'], 'Ruled Cost': row['Avg_C_D'],
-                        'Cum_V_res': row['Cum_V_res']
-                    })
-                    
-        df_ctrl = df[df['Sim_Type'] == 2]
-        top_ctrl = df_ctrl.sort_values('Cum_V_res', ascending=ascending_order).head(N_PERFORMERS)
-        for _, row in top_ctrl.iterrows():
-            data_records.append({
-                'Archetype': 'Control', 'Simulation': 'Sim 2 Control',
-                'Ruler P_H': row['Avg_P_R'], 'Ruled P_H': row['Avg_P_D'],
-                'Ruler Cost': row['Avg_C_R'], 'Ruled Cost': row['Avg_C_D'],
-                'Cum_V_res': row['Cum_V_res']
-            })
-                    
-        df_perf = pd.DataFrame(data_records)
-        
-        if not df_perf.empty:
-            df_melt = pd.melt(
-                df_perf, id_vars=['Archetype', 'Simulation'], 
-                value_vars=['Ruler P_H', 'Ruled P_H', 'Ruler Cost', 'Ruled Cost'],
-                var_name='Metric', value_name='Value'
-            )
-            
-            fig, axes = plt.subplots(2, 2, figsize=(16, 12))
-            metrics = ['Ruler P_H', 'Ruled P_H', 'Ruler Cost', 'Ruled Cost']
-            x_order = archetypes + ['Control']
-            hue_order = list(custom_color_map.keys())
-            
-            for ax, metric in zip(axes.flatten(), metrics):
-                safe_barplot(ax, 'Archetype', 'Value', 'Simulation', df_melt[df_melt['Metric'] == metric], custom_color_map, hue_order=hue_order)
-                ax.set_title(f"Average {metric}", fontweight='bold')
-                ax.set_ylabel("Value (Mean +/- SD)")
-                ax.set_xlabel("")
-                if ax != axes[0, 1]:
-                    if ax.get_legend() is not None:
-                        ax.get_legend().remove()
-                else:
-                    ax.legend(title="Framework", bbox_to_anchor=(1.05, 1), loc='upper left')
-                    
-            plt.suptitle(f"Performance Metrics: 4-Panel Analysis ({extremity} {N_PERFORMERS} Performers)", fontsize=16, fontweight='bold')
-            plt.tight_layout(rect=[0, 0, 0.9, 1])
-            
-            img_path = os.path.join(target_dir, f"perf_archetypes_4panel_{extremity.lower()}.png")
-            plt.savefig(img_path)
-            plt.close()
-            perf_images.append(img_path)
-
-    fig, axes = plt.subplots(1, 2, figsize=(20, 8), sharey=True)
-    
-    for idx, extremity in enumerate(['Top', 'Bottom']):
-        ax = axes[idx]
-        ascending_order = True if extremity == 'Bottom' else False
-        pros_records = []
-        
-        for sim_type in range(3, 9):
-            sim_label = {3:'Sim 3 Neutral', 4:'Sim 4 Neutral TFT', 5:'Sim 5 Agg Ruler', 6:'Sim 6 Agg Ruler TFT', 7:'Sim 7 Agg Ruled', 8:'Sim 8 Agg Ruled TFT'}[sim_type]
-            for arch in archetypes:
-                df_sub = df[(df['Sim_Type'] == sim_type) & (df['Archetype'] == arch)]
-                top_perf = df_sub.sort_values('Cum_V_res', ascending=ascending_order).head(N_PERFORMERS)
-                for _, row in top_perf.iterrows():
-                    pros_records.append({'Archetype': arch, 'Simulation': sim_label, 'Cum_V_res': row['Cum_V_res']})
-                    
-        df_ctrl = df[df['Sim_Type'] == 2]
-        top_ctrl = df_ctrl.sort_values('Cum_V_res', ascending=ascending_order).head(N_PERFORMERS)
-        for _, row in top_ctrl.iterrows():
-            pros_records.append({'Archetype': 'Control', 'Simulation': 'Sim 2 Control', 'Cum_V_res': row['Cum_V_res']})
-            
-        df_pros = pd.DataFrame(pros_records)
-        if not df_pros.empty:
-            safe_barplot(ax, 'Archetype', 'Cum_V_res', 'Simulation', df_pros, custom_color_map, hue_order=list(custom_color_map.keys()))
-            ax.set_title(f"{extremity} {N_PERFORMERS} Performers Prosperity", fontweight='bold')
-            ax.set_ylabel("Cumulative Perceived Value (Cum_V_res)" if idx == 0 else "")
-            ax.set_xlabel("")
-            if idx == 0:
-                if ax.get_legend() is not None:
-                    ax.get_legend().remove()
-            else:
-                ax.legend(title="Framework", bbox_to_anchor=(1.05, 1), loc='upper left')
-
-    plt.suptitle("Prosperity Scores (Cumulative Vresidual) Comparison Across Simulations", fontsize=16, fontweight='bold')
-    plt.tight_layout(rect=[0, 0, 0.9, 1])
-    pros_path = os.path.join(target_dir, "perf_consolidated_prosperity.png")
-    plt.savefig(pros_path)
-    plt.close()
-    perf_images.append(pros_path)
-    
-    return perf_images
-
-# ==========================================
-# 8. REPORT & ARCHIVE GENERATION
-# ==========================================
-def generate_report(images, rendered_paths, perf_images, target_dir, df):
+def generate_report(images, target_dir, df):
     doc = docx.Document()
     
-    # Modify global styles
     if 'Normal' in doc.styles:
         style_normal = doc.styles['Normal']
         style_normal.paragraph_format.alignment = WD_ALIGN_PARAGRAPH.JUSTIFY
@@ -1190,7 +1263,7 @@ def generate_report(images, rendered_paths, perf_images, target_dir, df):
         r.add_picture(img_path, width=width)
 
     doc.add_heading('Ruler vs Ruled: Monte Carlo Simulation Report', 0)
-    doc.add_paragraph("Ruler vs Ruled model created by Larzsolice Aarend (find me on Medium).")
+    doc.add_paragraph("Ruler vs Ruled model created by the Pragmatic Realist (find me on Substack).")
     
     doc.add_heading('1. Introduction & Game Overview', level=1)
     doc.add_paragraph("This report presents the findings from an advanced Monte Carlo simulation of the 'Ruler vs. Ruled' dynamic. The model is structured as an escalating, multi-turn game of Chicken, where two actors (the Ruler and the Ruled) interact over a maximum of 1,000 steps per simulation.")
@@ -1206,6 +1279,7 @@ def generate_report(images, rendered_paths, perf_images, target_dir, df):
     doc.add_paragraph("6. Simulation 6 (Aggressive Ruler TFT): Ruler remains strictly Aggressive (>0.5); Ruled drops the neutral posture and adopts Tit-for-Tat copying.")
     doc.add_paragraph("7. Simulation 7 (Aggressive Ruled): Ruler is neutral; Ruled has a fixed base hawkishness >0.5.")
     doc.add_paragraph("8. Simulation 8 (Aggressive Ruled TFT): Ruler adopts TFT copying; Ruled remains strictly Aggressive (>0.5).")
+    doc.add_paragraph("9. Simulation 9 (Blind TFT Control): A repeat of Simulation 2, but with both players using a Tit-for-Tat strategy, without responding to societal decay.")
     
     doc.add_heading('Strategic National Archetypes (Conscious Decay)', level=2)
     doc.add_paragraph("For simulations incorporating environmental decay awareness (Sims 3-8), we define five explicit aversion reactions:")
@@ -1214,57 +1288,27 @@ def generate_report(images, rendered_paths, perf_images, target_dir, df):
     doc.add_paragraph("3. Fools: Symmetrically aggressive, resisting compromise and triggering stalemates (Sub-linear square-root scaling).")
     doc.add_paragraph("4. Tyrants: Hawkish Ruler (cushioned decay) and dovish Ruled (linear decay).")
     doc.add_paragraph("5. Brinksmen: Hawkish Ruled (cushioned decay) and dovish Ruler (linear decay).")
-    
-    doc.add_heading('3. Methodology & Data Processing', level=1)
-    
-    doc.add_heading('Principal Component Analysis (PCA)', level=2)
-    doc.add_paragraph("Principal Component Analysis (PCA) is a robust dimensionality reduction algorithm used to visualize complex, multi-dimensional data architectures. In this analysis, we utilize PCA to compress six core behavioral metrics into a readable 2D geometric coordinate space:")
-    
-    # Isolate bullet points to apply explicit Left Alignment styles
-    bullet_list = [
-        "• Average Ruler Hawkishness",
-        "• Average Ruled Hawkishness",
-        "• Average Ruler Cost",
-        "• Average Ruled Cost",
-        "• Average Ruler Aversion Penalty",
-        "• Average Ruled Aversion Penalty"
-    ]
-    for bullet_text in bullet_list:
-        bullet_p = doc.add_paragraph(bullet_text)
-        bullet_p.alignment = WD_ALIGN_PARAGRAPH.LEFT
-        
-    doc.add_paragraph("By explicitly excluding the actual 'Prosperity Score' (Cumulative V_res) from the PCA input matrix, we prevent scale-drowning and prevent the PCA from simply sorting by outcome. This approach ensures that the geometric clusters uniquely reveal the underlying behavioral manifolds, allowing us to observe how differing strategic postures naturally fall into high-prosperity or catastrophic outcome basins.")
-    
-    doc.add_heading('KDE Valley Clustering & Bandwidth Optimization', level=2)
-    doc.add_paragraph("To objectively segment these geometric outcomes without relying on arbitrary binning or hardcoded thresholds, we perform a 1D Kernel Density Estimation (KDE) over the sorted Cumulative V_res scores. Finding the optimal curve bandwidth dynamically ensures that we capture genuine multi-modal outcome clusters. The algorithm sweeps through bandwidth multipliers at fine increments (0.01) to identify the model that preserves maximum structural granularity (valleys). To reject high-frequency noise and prevent overfitting, the system automatically excludes the top 5 sharpest peaks. The local minima ('valleys') in this optimized density distribution act as natural boundaries, defining discrete performance clusters.")
-    
-    doc.add_heading('Visual Marker Guide', level=2)
-    doc.add_paragraph("Throughout the PCA scatter plots, distinct visual markers highlight systemic extremes within each space:")
-    doc.add_paragraph("• Standard Survivals: Transparent circles with no borders.")
-    doc.add_paragraph("• Failed Societies: Solid crosses, matching the cluster color, indicating Revolution or Crackdown.")
-    doc.add_paragraph("• Elite Performers (Top 100): Highlighted with transparent diamonds featuring solid black borders, tracking the most prosperous trajectories.")
-    doc.add_paragraph("• Worst Performers (Bottom 100): Highlighted with standard black crosses if the simulation failed, or transparent circles with a thin black border if they miraculously survived despite operating at the absolute bottom of the systemic prosperity curve.")
 
-    doc.add_heading('4. State Failure Probability Analysis', level=1)
-    doc.add_paragraph("This section details the exact probabilities of early state failure (and the corresponding triggers) across the strategic national groups. Each archetype is presented in its own table, with the blind Sim 2 Control included in every table as the comparative baseline.")
     
+    doc.add_heading('3. State Failure Probability Analysis', level=1)
+    doc.add_paragraph("This section details the exact probabilities of early state failure (and the corresponding triggers) across the strategic national groups. Each archetype is presented in its own table, with the blind Sim 2 Control and Sim 9 Control TFT included in every table as the comparative baselines.")
+
     archetypes = ['Equals', 'Cowards', 'Fools', 'Brinksmen', 'Tyrants']
-    df_control = df[df['Sim_Type'] == 2]
+    df_control_2 = df[df['Sim_Type'] == 2]
+    df_control_9 = df[df['Sim_Type'] == 9]
     
     def get_failure_stats(sub_df):
-        total_n = len(sub_df)
-        if total_n > 0:
-            survived_count = len(sub_df[sub_df['Terminal_Status'] == 'Survived'])
-            rev_count = len(sub_df[sub_df['Terminal_Status'] == 'Revolution'])
-            crack_count = len(sub_df[sub_df['Terminal_Status'] == 'Crackdown'])
-            prob_failure = (total_n - survived_count) / total_n
-            prob_rev = rev_count / total_n
-            prob_crack = crack_count / total_n
-        else:
-            prob_failure = prob_rev = prob_crack = 0.0
-        return prob_failure, prob_rev, prob_crack
+        if not sub_df.empty:
+            total_n = sub_df['Total_Count'].sum()
+            survived_count = sub_df['Survived_Count'].sum()
+            rev_count = sub_df['Revolution_Count'].sum()
+            crack_count = sub_df['Crackdown_Count'].sum()
+            if total_n > 0:
+                return (total_n - survived_count) / total_n, rev_count / total_n, crack_count / total_n
+        return 0.0, 0.0, 0.0
 
-    ctrl_fail, ctrl_rev, ctrl_crack = get_failure_stats(df_control)
+    ctrl_2_fail, ctrl_2_rev, ctrl_2_crack = get_failure_stats(df_control_2)
+    ctrl_9_fail, ctrl_9_rev, ctrl_9_crack = get_failure_stats(df_control_9)
     
     for arch in archetypes:
         doc.add_heading(f"Archetype: {arch}", level=2)
@@ -1274,12 +1318,17 @@ def generate_report(images, rendered_paths, perf_images, target_dir, df):
         hdr_cells[0].text, hdr_cells[1].text = 'Configuration', 'Total Failure'
         hdr_cells[2].text, hdr_cells[3].text = 'Revolution (Ruler Lost)', 'Crackdown (Ruled Lost)'
         
-        # Insert Control
         row_cells = table.add_row().cells
         row_cells[0].text = 'Sim 2 Control'
-        row_cells[1].text = f"{ctrl_fail:.2%}"
-        row_cells[2].text = f"{ctrl_rev:.2%}"
-        row_cells[3].text = f"{ctrl_crack:.2%}"
+        row_cells[1].text = f"{ctrl_2_fail:.2%}"
+        row_cells[2].text = f"{ctrl_2_rev:.2%}"
+        row_cells[3].text = f"{ctrl_2_crack:.2%}"
+        
+        row_cells = table.add_row().cells
+        row_cells[0].text = 'Sim 9 Control TFT'
+        row_cells[1].text = f"{ctrl_9_fail:.2%}"
+        row_cells[2].text = f"{ctrl_9_rev:.2%}"
+        row_cells[3].text = f"{ctrl_9_crack:.2%}"
         
         for sim_type in range(3, 9):
             sname = {3:'Neutral', 4:'Neutral TFT', 5:'Agg Ruler', 6:'Agg Ruler TFT', 7:'Agg Ruled', 8:'Agg Ruled TFT'}[sim_type]
@@ -1292,106 +1341,56 @@ def generate_report(images, rendered_paths, perf_images, target_dir, df):
             row_cells[2].text = f"{p_rev:.2%}"
             row_cells[3].text = f"{p_crack:.2%}"
 
-    doc.add_heading('5. Analytical Visualizations', level=1)
+    doc.add_heading('4. Analytical Visualizations', level=1)
+    for img_path in images:
+        add_centered_image(doc, img_path, Inches(6.5))
     
-    doc.add_heading('5.1 Unified PCA Projections', level=2)
-    doc.add_paragraph("The Unified PCA plot projects all national archetypes together into a single global 2D manifold. This visualization helps us identify how differing strategic behavioral groups separate and cluster globally based on their core performance variables.")
-    add_centered_image(doc, images[0], Inches(6.0))
-    
-    doc.add_heading('5.2 Case-Specific Local PCA Projections', level=2)
-    doc.add_paragraph("These projections isolate the fixed starting quadrants of the Sim 2 Control group.")
-    
-    cases = ['DD', 'DH', 'HD', 'HH', 'RR']
-    for i, case in enumerate(cases):
-        doc.add_heading(f"Case {case} Localized Space", level=3)
-        add_centered_image(doc, images[1 + i], Inches(5.0))
-    
-    doc.add_heading('5.3 Category-Specific Local PCA Projections', level=2)
-    doc.add_paragraph("These category-specific projections isolate each individual framework. The PCA and scaling here are calculated locally strictly on the sliced data, revealing internal variance, survival thresholds, and fine-grained cluster boundaries specific to that archetype's environment.")
-    doc.add_heading("Sim 2 Control Baseline Space", level=3)
-    add_centered_image(doc, rendered_paths[('category', 'Sim_2_Control')], Inches(5.0))
-    
-    for arch in archetypes:
-        doc.add_heading(f"Archetype: {arch}", level=3)
-        doc.add_paragraph("Top Row: Neutral Players (Base vs TFT) | Middle Row: Aggressive Ruler (Base vs TFT) | Bottom Row: Aggressive Ruled (Base vs TFT)")
-        
-        img_table = doc.add_table(rows=3, cols=2)
-        pairs = [
-            (f"Sim_3_{arch}", f"Sim_4_{arch}"),
-            (f"Sim_5_{arch}", f"Sim_6_{arch}"),
-            (f"Sim_7_{arch}", f"Sim_8_{arch}")
-        ]
-        
-        for r_idx, (left_key, right_key) in enumerate(pairs):
-            cell_left = img_table.cell(r_idx, 0)
-            cell_left.paragraphs[0].alignment = WD_ALIGN_PARAGRAPH.CENTER
-            run_left = cell_left.paragraphs[0].add_run()
-            run_left.add_picture(rendered_paths[('category', left_key)], width=Inches(3.0))
-            
-            cell_right = img_table.cell(r_idx, 1)
-            cell_right.paragraphs[0].alignment = WD_ALIGN_PARAGRAPH.CENTER
-            run_right = cell_right.paragraphs[0].add_run()
-            run_right.add_picture(rendered_paths[('category', right_key)], width=Inches(3.0))
-            
-    doc.add_heading('5.4 Cluster Abundance Sweeps', level=2)
-    doc.add_paragraph("These plots demonstrate the un-filtered KDE cluster population density across each simulation type.")
-    for i in range(8):
-        add_centered_image(doc, images[6 + i], Inches(5.5))
-        
-    doc.add_heading('5.5 Stacked Early State Failure Rates', level=2)
-    doc.add_paragraph("These stacked bar charts isolate the exact modes of failure—Revolution or Crackdown. By excluding survivals, the heights of the bars represent the total proportional probability that a given configuration will fail. Sample sizes (N=...) are provided on the x-axis to confirm distribution consistency.")
-    for img_path in images[-3:]:
-        add_centered_image(doc, img_path, Inches(6.0))
-        
-    doc.add_heading('5.6 4-Panel Performance Metrics', level=2)
-    doc.add_paragraph("This 4-panel breakdown separates the underlying variables—Ruler Hawkishness, Ruled Hawkishness, Ruler Cost, and Ruled Cost—for both the top performing and bottom performing states. This structure isolates the precise operational behaviors that drive the best (and worst) outcomes within each archetype.")
-    doc.add_paragraph("Note on Negative Costs: The simulation calculates costs such that accommodating (Dovish) behavior actively reduces the cost burden. Consequently, performance metrics occasionally yield negative average costs, particularly among highly cooperative top performers. In these charts, negative cost indicates net added value (prosperity preservation) rather than debt.")
-    add_centered_image(doc, perf_images[0], Inches(6.0)) # Top Performers
-    add_centered_image(doc, perf_images[1], Inches(6.0)) # Bottom Performers
-    
-    doc.add_heading('5.7 Consolidated Prosperity Score Comparison', level=2)
-    doc.add_paragraph("This final comparison chart aligns the absolute Prosperity Scores (Cumulative V_res) across all frameworks. Separated from the other metrics to prevent scale-drowning, it effectively compares the absolute wealth generation efficiency across strategies and archetypes.")
-    add_centered_image(doc, perf_images[2], Inches(6.0)) # Prosperity
-    
-    doc.add_heading('6. Conclusion & Core Insights', level=1)
+    doc.add_heading('5. Conclusion & Core Insights', level=1)
     doc.add_paragraph("Based on the comprehensive multi-framework analysis generated by this simulation run, several profound socio-structural dynamics emerge:")
+
     doc.add_paragraph("1. The Stabilizing Power of Tit-for-Tat (TFT): Across nearly all aggressive and unyielding archetypes (most notably the Fools and Tyrants), the introduction of a reactive, copy-based strategy dramatically curtails systemic collapse. By structurally guaranteeing retaliation against aggressive overreach, TFT functions as a powerful institutional governor, breaking runaway escalatory cycles before they drain the societal resource pool.")
-    doc.add_paragraph("2. The Lethality of Strategic Blindness: The Sim 2 Control baseline operates with fixed ideological parameters and zero internal awareness of the wasting systemic value (V_res). This configuration consistently yields the highest rates of catastrophic collapse. This suggests that structural ignorance or political blindness to environmental/systemic decay is inherently more fatal to a society than explicit aggression.")
+    doc.add_paragraph("2. The Lethality of Strategic Blindness: The Sim 2 Control baseline operates with fixed ideological parameters and zero internal awareness of the wasting systemic value (V_res). This configuration consistently yields the highest rates of catastrophic collapse, which results in escalation spirals when Tit-for-Tat is introduced. This suggests that structural ignorance or political blindness to environmental/systemic decay is inherently more fatal to a society than explicit aggression. If neither side are willing to, or capable of reacting to the decline of society, because of foolishness or propaganda, the probability os systemic collapse is maximised.")
     doc.add_paragraph("3. The Preservation Efficiency of Symmetrical De-escalation: The 'Cowards' (highly risk-averse) and 'Equals' (cooperative) archetypes consistently demonstrate near-perfect survival rates and maximize the prosperity metric. In a multi-round environment characterized by mutual destruction (the Hawk-Dove dynamic), rapid, symmetrical capitulation in response to resource scarcity effectively insulates the collective wealth from structural friction.")
+
+    doc.add_paragraph("")
+    doc.add_paragraph("The Ruler vs Ruled Monte Carlo Simulation was created by the Pragmatic Realist: https://thepragmaticrealist.substack.com.")
+
 
     report_path = os.path.join(target_dir, FILE_REPORT)
     doc.save(report_path)
     return report_path
 
-def create_archive(df_res, df_hist, df_pca_feat, report_path, plots_dir):
-    global global_actual_bw
+def create_archive(df_hist, report_path, plots_dir):
     counter = 1
     while os.path.exists(f"{OUTPUT_PREFIX}_{counter}.zip"):
         counter += 1
     zip_filename = f"{OUTPUT_PREFIX}_{counter}.zip"
-    
 
     print(f"\rPreparing optimized export data sheets... ")
 
-
-    summary_xlsx = os.path.join(plots_dir, FILE_SUMMARY)
-    history_xlsx = os.path.join(plots_dir, FILE_HISTORY)
-    pca_xlsx = os.path.join(plots_dir, FILE_PCA_FEATURES)
+    summary_file = os.path.join(plots_dir, FILE_SUMMARY)
+    history_file = os.path.join(plots_dir, FILE_HISTORY)
+    feat_file = os.path.join(plots_dir, FILE_FEATURES)
     params_txt = os.path.join(plots_dir, FILE_PARAMS)
     
-    print("Preparing Results Spread Sheet...")
-    df_res.to_excel(summary_xlsx, index=False)
-
-    print("Preparing PCA Spread Sheet...")
-    df_pca_feat.to_excel(pca_xlsx, index=False)
-    
+    if SORT_DATA:
+        print("\nSorting huge output files... (Requires extensive RAM!)")
+        for fpath in [summary_file, feat_file]:
+            if os.path.exists(fpath):
+                try:
+                    df_sort = pd.read_csv(fpath)
+                    df_sort.sort_values(by=['Sim_Type', 'Archetype', 'Case'], inplace=True)
+                    df_sort.to_csv(fpath, index=False)
+                    del df_sort
+                except Exception as e:
+                    print(f"Warning: Could not sort data in memory: {e}")
     
     if not df_hist.empty:
         print("Preparing History Spread Sheet...")
-        df_hist_str = df_hist.map(lambda x: str(x) if pd.notna(x) else "")
-        df_hist_str.to_excel(history_xlsx)
+        df_hist_str = df_hist.applymap(lambda x: str(x) if pd.notna(x) else "")
+        df_hist_str.to_csv(history_file)
     else:
-        pd.DataFrame({"Status": ["History logging disabled."]}).to_excel(history_xlsx, index=False)
+        pd.DataFrame({"Status": ["History logging disabled."]}).to_csv(history_file, index=False)
 
     print("Preparing 'params.txt'...")
     with open(params_txt, "w") as f:
@@ -1399,17 +1398,11 @@ def create_archive(df_res, df_hist, df_pca_feat, report_path, plots_dir):
         f.write(f"MAX_COST_PER_STEP = {MAX_COST_PER_STEP}\n")
         f.write(f"MAX_STEPS = {MAX_STEPS}\n")
         f.write(f"N_REPS_PER_CONFIG = {N_REPS}\n")
-        f.write(f"KDE_BANDWIDTH_ADJUST = {global_actual_bw} (Mode: {KDE_BW_ADJUST})\n")
-        f.write(f"KDE_TOP_N_PEAKS = {KDE_TOP_N_PEAKS}\n")
-        f.write(f"KDE_EXCLUDE_TOP_N_PEAKS = {KDE_EXCLUDE_TOP_N_PEAKS}\n")
-        f.write(f"KDE_OPTIMISATION_STEP = {KDE_OPTIMISATION_STEP}\n")
-        f.write(f"PLOT_DOT_SIZE = {PLOT_DOT_SIZE}\n")
 
     print("Preparing Graph Folder...")
-    files_to_pack = [(report_path, FILE_REPORT), (summary_xlsx, FILE_SUMMARY), (history_xlsx, FILE_HISTORY), (pca_xlsx, FILE_PCA_FEATURES), (params_txt, FILE_PARAMS)]
+    files_to_pack = [(report_path, FILE_REPORT), (summary_file, FILE_SUMMARY), (history_file, FILE_HISTORY), (feat_file, FILE_FEATURES), (params_txt, FILE_PARAMS)]
     for f in os.listdir(plots_dir):
         if f.endswith(".png"): files_to_pack.append((os.path.join(plots_dir, f), os.path.join("Graphs", f)))
-
 
     total_pack_files = len(files_to_pack)
     print(f"Packaging {total_pack_files} files directly into {zip_filename}...")
@@ -1419,59 +1412,21 @@ def create_archive(df_res, df_hist, df_pca_feat, report_path, plots_dir):
         for idx, (filepath, arcname) in enumerate(files_to_pack):
             zipf.write(filepath, arcname=arcname)
             completed = idx + 1
-            elapsed = time.time() - start_pack_time
-            speed = completed / elapsed if elapsed > 0 else 0
-            bar_length = 30
-            filled_length = int(round(bar_length * completed / total_pack_files))
-            bar_chars = '#' * filled_length + '-' * (bar_length - filled_length)
-            percentage = (completed / total_pack_files) * 100
-            print(f"\rPackaging ZIP Archive: [{bar_chars}] {completed}/{total_pack_files} ({percentage:.1f}%) | Elapsed: {elapsed:.1f}s | Speed: {speed:.1f} files/s", end="", flush=True)
+            if completed % max(1, total_pack_files // 10) == 0 or completed == total_pack_files:
+                elapsed = time.time() - start_pack_time
+                speed = completed / elapsed if elapsed > 0 else 0
+                bar_length = 30
+                filled_length = int(round(bar_length * completed / total_pack_files))
+                bar_chars = '#' * filled_length + '-' * (bar_length - filled_length)
+                percentage = (completed / total_pack_files) * 100
+                print(f"\rPackaging ZIP Archive: [{bar_chars}] {completed}/{total_pack_files} ({percentage:.1f}%) | Speed: {speed:.1f} files/s", end="", flush=True)
             
     print("\nCleaning up intermediate workspace files...")
     shutil.rmtree(plots_dir)
     print(f"Archive successfully generated: {zip_filename}")
 
 # ==========================================
-# 9. RUNNING THE BATCH SIMULATIONS
-# ==========================================
-def run_all_simulations():
-    cases = ['DD', 'DH', 'HD', 'HH', 'RR']
-    archetypes = ['Equals', 'Cowards', 'Fools', 'Brinksmen', 'Tyrants']
-    jobs = []
-    
-    # Sim 1 (10x N_REPS)
-    for _ in range(N_REPS * 10):
-        jobs.append(('SIMULATE', (1, None, None)))
-        
-    # Sim 2 (N_REPS per case)
-    for case in cases:
-        for _ in range(N_REPS):
-            jobs.append(('SIMULATE', (2, case, None)))
-            
-    # Sims 3 through 8 (Standardized identical simulation volume per strategic group)
-    # Passed None for case here to strictly isolate 'RR' to Sim 2
-    for sim_type in range(3, 9):
-        for arch in archetypes:
-            for _ in range(N_REPS * 5): 
-                jobs.append(('SIMULATE', (sim_type, None, arch)))
-                
-    total_tasks = len(jobs)
-    print(f"Total simulations to execute: {total_tasks}")
-    task_results = run_parallel_jobs(jobs, desc="Executing Simulations")
-    
-    results = []
-    histories = {}
-    for idx, (res, hist) in enumerate(task_results):
-        results.append(res)
-        if RECORD_HISTORY:
-            histories[idx] = hist
-            
-    df_res = pd.DataFrame(results)
-    df_hist = pd.DataFrame() 
-    return df_res, df_hist
-
-# ==========================================
-# 10. MAIN EXECUTION ROUTINE
+# 6. MAIN EXECUTION ROUTINE
 # ==========================================
 if __name__ == "__main__":
     if os.path.exists(TEMP_DIR):
@@ -1480,11 +1435,9 @@ if __name__ == "__main__":
     
     init_persistent_workers()
     try:
-        df_res, df_hist = run_all_simulations()
-        df_res, df_pca_feat, top_5, bottom_5_surv, term_clusters = process_data(df_res)
-        images, rendered_paths = generate_graphs(df_res, top_5, bottom_5_surv, term_clusters, TEMP_DIR)
-        perf_images = generate_performance_graphs(df_res, TEMP_DIR)
-        report_path = generate_report(images, rendered_paths, perf_images, TEMP_DIR, df_res)
-        create_archive(df_res, df_hist, df_pca_feat, report_path, TEMP_DIR)
+        df_agg, df_hist = run_all_simulations()
+        images = generate_graphs(df_agg, TEMP_DIR)
+        report_path = generate_report(images, TEMP_DIR, df_agg)
+        create_archive(df_hist, report_path, TEMP_DIR) # Can be commented out to save disc space
     finally:
         shutdown_persistent_workers()
